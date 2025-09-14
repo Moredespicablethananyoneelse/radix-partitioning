@@ -38,7 +38,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write(Tuple* intput, T
 void radix_partition_with_contiguous_buffers_streamed_256_write_v2(Tuple* intput, Tuple*& output, Index *histogram, Index *unpaddedBucketSizes, const UInt buffered_tuples);
 
 void radix_partition_with_contiguous_buffers_streamed_256_write_experimental(Tuple* intput, Tuple*& output, Index *histogram, Index *unpaddedBucketSizes, const UInt buffered_tuples);
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_prefetched(Tuple * restrict input, Tuple *& restrict output, Index * restrict histogram, Index * restrict unpaddedBucketSizes, const UInt buffered_tuples);
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_prefetched(Tuple * __restrict__ input, Tuple *& __restrict__ output, Index * __restrict__ histogram, Index * __restrict__ unpaddedBucketSizes, const UInt buffered_tuples);
 
 void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fillstate(Tuple* intput, Tuple*& output, Index *histogram, Index *unpaddedBucketSizes, const UInt buffered_tuples);
 void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_nothing(Tuple* intput, Tuple*& output, Index *histogram, Index *unpaddedBucketSizes, const UInt buffered_tuples);

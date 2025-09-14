@@ -42,7 +42,7 @@ void radix_partition_without_buffers(Tuple *input, Tuple *output, Index *histogr
 	constexpr UInt shift = 32 - log2partitions();
 	__attribute__((aligned(64))) Index *final_buckets;
 
-	posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
 	memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
 
 	for(Index j = 0; j < ELEMS; ++j){
@@ -79,11 +79,11 @@ void radix_partition_without_buffers_v2(Tuple *input, Tuple *output, Index *hist
 	constexpr UInt shift = shift_distance();
 
 	__attribute__((aligned(64))) Index *final_buckets;
-	posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
 	memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
 
 	__attribute__((aligned(64))) Index *targets;
-	posix_memalign((void**)&targets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&targets, 64, N_PARTITIONS * sizeof(Index));
 
 	for(Index j = 0; j < ELEMS; ++j){
 		++final_buckets[GET_BUCKET(input[j].value, shift)];
@@ -116,7 +116,7 @@ void radix_partition_without_buffers_prefetched(Tuple *input, Tuple *output, Ind
 	constexpr UInt shift = shift_distance();
 	__attribute__((aligned(64))) Index *final_buckets;
 
-	posix_memalign((void**)&final_buckets, 64, (N_PARTITIONS + 1) * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, (N_PARTITIONS + 1) * sizeof(Index));
 	memset(final_buckets, 0, (N_PARTITIONS + 1) * sizeof(Index));
 
 	final_buckets++;
@@ -149,9 +149,9 @@ void radix_partition_with_contiguous_buffers(Tuple *input, Tuple *output, Index 
 	__attribute__((aligned(64))) Tuple *buffers;
 	__attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 
-	posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
 	memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-	posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+	(void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
 	memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
 	for(Index j = 0; j < ELEMS; ++j){
@@ -197,9 +197,9 @@ void radix_partition_with_contiguous_buffers_prefetched(Tuple *input, Tuple *out
     __attribute__((aligned(64))) Tuple *buffers;
     __attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 
-    posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+    (void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
     memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-    posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+    (void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
     memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
     for(Index j = 0; j < ELEMS; ++j){
@@ -246,9 +246,9 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_prefetched(Tuple
 	__attribute__((aligned(64))) Tuple *buffers;
 	__attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 
-	posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
 	memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-	posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+	(void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
 	memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
 	for(Index j = 0; j < ELEMS; ++j){
@@ -273,7 +273,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_prefetched(Tuple
 	memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
 
 	// allocate output according to histogram
-	posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
+	(void)posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
 
 	//_mm_stream_si64 (__int64* mem_addr, __int64 a)
 	__attribute__((aligned(64))) Index bucket_num = 0;
@@ -316,9 +316,9 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_prefetched_v2(Tu
 	__attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 	constexpr UInt shift = shift_distance();
 
-	posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
 	memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-	posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+	(void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
 	memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
 	for(Index j = 0; j < ELEMS; ++j){
@@ -343,7 +343,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_prefetched_v2(Tu
 	memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
 
 	// allocate output according to histogram
-	posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
+	(void)posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
 
 	//_mm_stream_si64 (__int64* mem_addr, __int64 a)
 	__attribute__((aligned(64))) Index bucket_num = 0;
@@ -386,9 +386,9 @@ void radix_partition_with_contiguous_buffers_streamed_256_write(Tuple *input, Tu
 	__attribute__((aligned(64))) Tuple *buffers;
 	__attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 
-	posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
 	memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-	posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+	(void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
 	memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
 	for(Index j = 0; j < ELEMS; ++j){
@@ -413,7 +413,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write(Tuple *input, Tu
 	memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
 
 	// allocate output according to histogram
-	posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
+	(void)posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
 
 	//_mm_stream_si64 (__int64* mem_addr, __int64 a)
 	__attribute__((aligned(64))) Index bucket_num = 0;
@@ -452,9 +452,9 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_v2(Tuple *input,
 	__attribute__((aligned(64))) Tuple *buffers;
 	__attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 
-	posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+	(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
 	memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-	posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+	(void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
 	memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
 	for(Index j = 0; j < ELEMS; ++j){
@@ -479,7 +479,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_v2(Tuple *input,
 	memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
 
 	// allocate output according to histogram
-	posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
+	(void)posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
 
 	//_mm_stream_si64 (__int64* mem_addr, __int64 a)
 	__attribute__((aligned(64))) Index bucket_num = 0;
@@ -518,9 +518,9 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_v2_unpadded(Tupl
     __attribute__((aligned(64))) Tuple *buffers;
     __attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 
-    posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+    (void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
     memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-    posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+    (void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
     memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
     for(Index j = 0; j < ELEMS; ++j){
@@ -586,9 +586,9 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_v2_unpadded_pref
     __attribute__((aligned(64))) Tuple *buffers;
     __attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
 
-    posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+    (void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
     memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
-    posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+    (void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
     memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
 
     for(Index j = 0; j < ELEMS; ++j){
@@ -672,7 +672,7 @@ typedef struct {
 } cacheline_t;
 
 #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental(Tuple * restrict input, Tuple *& restrict output, Index * restrict histogram, Index * restrict unpaddedBucketSizes, const UInt buffered_tuples) {
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental(Tuple * __restrict__ input, Tuple *& __restrict__ output, Index * __restrict__ histogram, Index * __restrict__ unpaddedBucketSizes, const UInt buffered_tuples) {
     __attribute__((aligned(64))) Index final_buckets[N_PARTITIONS];
 	__attribute__((aligned(64))) cacheline_t buffers[N_PARTITIONS];
 
@@ -704,7 +704,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental(Tup
 	}
 
 	// allocate output according to histogram (including padding)
-	posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
+	(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
 
 	Index bucket_num = 0;
 
@@ -738,7 +738,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental(Tup
 #endif
 
 #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_PREFETCHED
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_prefetched(Tuple * restrict input, Tuple *& restrict output, Index * restrict histogram, Index * restrict unpaddedBucketSizes, const UInt buffered_tuples) {
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_prefetched(Tuple * __restrict__ input, Tuple *& __restrict__ output, Index * __restrict__ histogram, Index * __restrict__ unpaddedBucketSizes, const UInt buffered_tuples) {
     __attribute__((aligned(64))) Index final_buckets[N_PARTITIONS];
     __attribute__((aligned(64))) cacheline_t buffers[N_PARTITIONS];
 
@@ -770,7 +770,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_pre
     }
 
     // allocate output according to histogram (including padding)
-    posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
+    (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
 
     Index bucket_num = 0;
 
@@ -808,7 +808,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_pre
 #endif
 
 #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_UNPADDED
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_unpadded(Tuple * restrict input, Tuple * restrict output, Index * restrict histogram, const UInt buffered_tuples) {
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_unpadded(Tuple * __restrict__ input, Tuple * __restrict__ output, Index * __restrict__ histogram, const UInt buffered_tuples) {
     __attribute__((aligned(64))) Index final_buckets[N_PARTITIONS];
     __attribute__((aligned(64))) cacheline_t buffers[N_PARTITIONS];
     constexpr UInt shift = shift_distance();
@@ -877,7 +877,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_unp
 #endif
 
 #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_FILLSTATE
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fillstate(Tuple * restrict input, Tuple *& restrict output, Index * restrict histogram, Index * restrict unpaddedBucketSizes, const UInt buffered_tuples) {
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fillstate(Tuple * __restrict__ input, Tuple *& __restrict__ output, Index * __restrict__ histogram, Index * __restrict__ unpaddedBucketSizes, const UInt buffered_tuples) {
 	__attribute__((aligned(64))) Index final_buckets[N_PARTITIONS];
 	__attribute__((aligned(64))) cacheline_t buffers[N_PARTITIONS];
 	__attribute__((aligned(64))) UInt targets[N_PARTITIONS];
@@ -910,7 +910,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fil
 	}
 
 	// allocate output according to histogram (including padding)
-	posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
+	(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
 
 	Index bucket_num = 0;
 
@@ -941,7 +941,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fil
 #endif
 
 #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_FILLSTATE_UNPADDED
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fillstate_unpadded(Tuple * restrict input, Tuple * restrict output, Index * restrict histogram, const UInt buffered_tuples) {
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fillstate_unpadded(Tuple * __restrict__ input, Tuple * __restrict__ output, Index * __restrict__ histogram, const UInt buffered_tuples) {
     __attribute__((aligned(64))) Index final_buckets[N_PARTITIONS];
     __attribute__((aligned(64))) cacheline_t buffers[N_PARTITIONS];
     __attribute__((aligned(64))) UInt targets[N_PARTITIONS];
@@ -1010,7 +1010,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_fil
 #endif
 
 #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_NOTHING
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_nothing(Tuple * restrict input, Tuple *& restrict output, Index * restrict histogram, Index * restrict unpaddedBucketSizes, const UInt buffered_tuples) {
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_nothing(Tuple * __restrict__ input, Tuple *& __restrict__ output, Index * __restrict__ histogram, Index * __restrict__ unpaddedBucketSizes, const UInt buffered_tuples) {
 	__attribute__((aligned(64))) Index final_buckets[N_PARTITIONS];
 	__attribute__((aligned(64))) cacheline_t buffers[N_PARTITIONS];
 	__attribute__((aligned(64))) UInt targets[N_PARTITIONS];
@@ -1044,7 +1044,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_not
 	}
 
 	// allocate output according to histogram (including padding)
-	posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
+	(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple) + 64 * N_PARTITIONS);
 
 	Index bucket_num = 0;
 
@@ -1074,7 +1074,7 @@ void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_not
 #endif
 
 #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_NOTHING_UNPADDED
-void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_nothing_unpadded(Tuple * restrict input, Tuple * restrict output, Index * restrict histogram, const UInt buffered_tuples) {
+void radix_partition_with_contiguous_buffers_streamed_256_write_experimental_nothing_unpadded(Tuple * __restrict__ input, Tuple * __restrict__ output, Index * __restrict__ histogram, const UInt buffered_tuples) {
     __attribute__((aligned(64))) Index final_buckets[N_PARTITIONS];
     __attribute__((aligned(64))) cacheline_t buffers[N_PARTITIONS];
     __attribute__((aligned(64))) UInt targets[N_PARTITIONS];

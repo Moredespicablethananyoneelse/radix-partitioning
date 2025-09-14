@@ -63,7 +63,7 @@ int main(int argc, char *argv[]){
 	uniform_int_distribution<UInt> dis_elem(0, numeric_limits<UInt>::max());
 
 	Tuple *input;
-	posix_memalign((void**)&input, 64, ELEMS * sizeof(Tuple));
+	(void)posix_memalign((void**)&input, 64, ELEMS * sizeof(Tuple));
 
 	cout << "Performing " << TOTAL_RUNS << " runs" << endl << endl;
 
@@ -113,7 +113,7 @@ int main(int argc, char *argv[]){
 
 		#ifdef UNBUFFERED
 		{
-			posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+			(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
 			__attribute__((aligned(64))) Index histogram[N_PARTITIONS];
 			cout << "Starting Single Threaded Radix Partition" << endl;
 			gettimeofday(&start_time, NULL);
@@ -128,7 +128,7 @@ int main(int argc, char *argv[]){
 
 		#ifdef UNBUFFERED_V2
 		{
-			posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+			(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
 			__attribute__((aligned(64))) Index histogram[N_PARTITIONS];
 			cout << "Starting Single Threaded Radix Partition (V2) and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
 			gettimeofday(&start_time, NULL);
@@ -143,7 +143,7 @@ int main(int argc, char *argv[]){
 
 		#ifdef UNBUFFERED_PREFETCHED
 		{
-			posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+			(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
 			__attribute__((aligned(64))) Index histogram[N_PARTITIONS];
 			cout << "Starting Single Threaded Radix Partition Unbuffered, Prefetched and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
 			gettimeofday(&start_time, NULL);
@@ -184,7 +184,7 @@ int main(int argc, char *argv[]){
 				return -1;
 			}
 			const UInt buffered_tuples = (UInt)atoi(argv[1]);
-			posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+			(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
 			__attribute__((aligned(64))) Index histogram[N_PARTITIONS];
 			cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous) and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
 			gettimeofday(&start_time, NULL);
@@ -204,7 +204,7 @@ int main(int argc, char *argv[]){
                 return -1;
             }
             const UInt buffered_tuples = (UInt)atoi(argv[1]);
-            posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+            (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
             __attribute__((aligned(64))) Index histogram[N_PARTITIONS];
             cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, perfetched) and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
             gettimeofday(&start_time, NULL);
@@ -224,7 +224,7 @@ int main(int argc, char *argv[]){
 				return -1;
 			}
 			const UInt buffered_tuples = (UInt)atoi(argv[1]);
-			posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+			(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
 			__attribute__((aligned(64))) Index histogram[N_PARTITIONS];
 			cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, streamed)." << endl;
 			gettimeofday(&start_time, NULL);
@@ -265,7 +265,7 @@ int main(int argc, char *argv[]){
 				return -1;
 			}
 			const UInt buffered_tuples = (UInt)atoi(argv[1]);
-//			posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+//			(void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
 			__attribute__((aligned(64))) Index histogram[N_PARTITIONS];
 			__attribute__((aligned(64))) Index unpaddedBucketSizes[N_PARTITIONS];
 			cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, 256 AVX streamed) and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
@@ -291,7 +291,7 @@ int main(int argc, char *argv[]){
                 cout << "Usage: " << argv[0] << " <BUFFERED_TUPLES in multiples of " << TUPLES_PER_CACHELINE << ">" <<endl;
                 return -1;
             }
-            posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+            (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
             __attribute__((aligned(64))) Index histogram[N_PARTITIONS];
             cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, 256 AVX streamed, unpadded) and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
             gettimeofday(&start_time, NULL);
@@ -315,7 +315,7 @@ int main(int argc, char *argv[]){
                 cout << "Usage: " << argv[0] << " <BUFFERED_TUPLES in multiples of " << TUPLES_PER_CACHELINE << ">" <<endl;
                 return -1;
             }
-            posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+            (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
             __attribute__((aligned(64))) Index histogram[N_PARTITIONS];
             cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, 256 AVX streamed, unpadded, prefetched) and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
             gettimeofday(&start_time, NULL);
@@ -367,7 +367,7 @@ int main(int argc, char *argv[]){
         #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_UNPADDED
         {
             const UInt buffered_tuples = TUPLES_PER_CACHELINE;
-            posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+            (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
             __attribute__((aligned(64))) Index histogram[N_PARTITIONS];
             cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, 256 AVX streamed, unpadded, micro-row) both and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
             gettimeofday(&start_time, NULL);
@@ -401,7 +401,7 @@ int main(int argc, char *argv[]){
         #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_FILLSTATE_UNPADDED
         {
             const UInt buffered_tuples = TUPLES_PER_CACHELINE;
-            posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+            (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
             __attribute__((aligned(64))) Index histogram[N_PARTITIONS];
             cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, 256 AVX streamed, unpadded, micro-row-fillstate-only) both and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
             gettimeofday(&start_time, NULL);
@@ -435,7 +435,7 @@ int main(int argc, char *argv[]){
         #ifdef CONTIGUOUS_BUFFERS_256STREAM_EXPERIMENTAL_NOTHING_UNPADDED
         {
             const UInt buffered_tuples = TUPLES_PER_CACHELINE;
-            posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+            (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
             __attribute__((aligned(64))) Index histogram[N_PARTITIONS];
             cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, 256 AVX streamed, unpadded, micro-row-nothing) both and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
             gettimeofday(&start_time, NULL);
