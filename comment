@@ -1,0 +1,1451 @@
+要理解 `UNBUFFERED_4KB_PAGE` 宏定义下的测试流程，需从 `main` 函数的初始化逻辑切入，逐步拆解输入数据准备、内存分配、基数分区执行、时间统计与结果校验的完整链路。以下按代码执行顺序逐模块详细解析：
+
+
+### 一、`main` 函数初始化与输入数据准备
+在进入 `UNBUFFERED_4KB_PAGE` 分支前，`main` 函数已完成基础环境初始化和输入数据生成，这是后续测试的前提，需先明确：
+
+#### 1. 随机数生成器初始化
+```cpp
+mt19937 gen(19508);  // 初始化Mersenne Twister随机数引擎，种子固定为19508（确保实验可复现）
+uniform_int_distribution<UInt> dis_key(0, numeric_limits<UInt>::max());  // 键的随机分布（未实际使用）
+uniform_int_distribution<UInt> dis_elem(0, numeric_limits<UInt>::max());  // 元素值的随机分布（取值范围：0到UInt最大值）
+```
+- **作用**：生成可复现的随机数据，用于填充输入数组 `input` 的 `rowId` 和 `value` 字段。
+- **关键细节**：种子固定为 `19508`，避免随机波动影响不同测试用例的性能对比。
+
+
+#### 2. 输入数组 `input` 内存分配（64字节对齐）
+```cpp
+Tuple *input;
+(void)posix_memalign((void**)&input, 64, ELEMS * sizeof(Tuple));
+```
+- **`posix_memalign`**：POSIX标准函数，用于分配指定对齐方式的内存，此处要求 **64字节对齐**（与CPU缓存行大小一致，避免“缓存行拆分”导致的性能损耗）。
+- **参数解析**：
+  - `(void**)&input`：输出参数，存储分配到的内存地址；
+  - `64`：内存对齐粒度（64字节）；
+  - `ELEMS * sizeof(Tuple)`：总分配大小（`ELEMS` 为宏定义的元素总数，`Tuple` 为自定义结构体，含 `rowId` 和 `value` 两个 `UInt` 字段，通常共8字节）。
+- **`(void)` 强制转换**：抑制编译器对函数返回值（成功返回0，失败返回非0）的未使用警告。
+
+
+#### 3. 多轮测试循环与单轮输入数据填充
+```cpp
+for (int i = 0; i < TOTAL_RUNS; i++) {  // TOTAL_RUNS：宏定义的测试总轮数（如3轮，取平均减少误差）
+    cout << "============================ Performing run " << i + 1 << " with " << ELEMS << " elements. ============================" << endl;
+    // 填充输入数组input的每个元素
+    for (size_t i = 0; i < ELEMS; ++i) {
+        UInt elem = dis_elem(gen);  // 生成随机UInt值
+        input[i].rowId = elem;      // 赋值给Tuple的rowId字段
+        input[i].value = elem;      // 赋值给Tuple的value字段（基数分区的“键”基于该字段）
+    }
+    // ... 后续分支测试（含UNBUFFERED_4KB_PAGE）
+}
+```
+- **多轮测试目的**：基数分区性能受CPU缓存、TLB（ Translation Lookaside Buffer ）状态影响，多轮测试取平均可降低偶然误差。
+- **输入数据特点**：`rowId` 和 `value` 完全一致，确保分区逻辑仅依赖 `value` 字段，避免额外变量干扰。
+
+
+### 二、`UNBUFFERED_4KB_PAGE` 分支核心逻辑（4KB普通页无缓冲基数分区）
+当代码编译时定义了 `UNBUFFERED_4KB_PAGE` 宏，会进入以下分支，执行 **基于4KB普通页、无中间缓冲区的单线程基数分区**，并统计时间、校验结果：
+
+#### 1. 输出数组 `output` 内存分配（4KB普通页 + 大页分配逻辑）
+```cpp
+output = (Tuple*)malloc_huge(ELEMS * sizeof(Tuple));
+```
+- **`malloc_huge` 函数**：专为大页内存设计的分配函数（定义在代码末尾），根据宏定义选择页大小：
+  - 因 `UNBUFFERED_4KB_PAGE` 被定义，宏 `FLAGS` 被设为 `MAP_PRIVATE|MAP_ANONYMOUS`（无 `MAP_HUGETLB` 大页标志），实际分配 **4KB普通页**；
+  - 内部调用 `mmap` 而非 `malloc`：`mmap` 可直接控制内存页属性（如普通页/大页），且避免 `malloc` 可能的内存碎片；
+  - 错误处理：若 `mmap` 返回 `MAP_FAILED`（内存分配失败），打印“Out of memory”并退出程序。
+
+
+#### 2. 直方图 `histogram` 初始化（64字节对齐）
+```cpp
+__attribute__((aligned(64))) Index histogram[N_PARTITIONS];
+```
+- **`__attribute__((aligned(64)))`**：GCC编译器扩展，强制 `histogram` 数组64字节对齐，确保访问时命中CPU缓存（避免跨缓存行访问）。
+- **`histogram` 作用**：记录每个分区（桶）的元素总数，是基数分区“两阶段”中的核心数据结构（第一阶段统计桶大小，第二阶段写入元素）。
+- **`N_PARTITIONS`**：宏定义的分区数（如256、512，需为2的幂，因基数分区通常基于键的二进制位分片）；`Index` 为 `size_t` 或 `uint64_t` 的别名，确保足够存储元素总数。
+
+
+#### 3. 性能计时开始与基数分区执行
+```cpp
+cout << "Starting Single Threaded Radix Partition with 4KB normal pages" << endl;
+gettimeofday(&start_time, NULL);  // 记录分区开始时间
+radix_partition_without_buffers(input, output, histogram);  // 核心：无缓冲基数分区函数
+gettimeofday(&end_time, NULL);    // 记录分区结束时间
+```
+- **`gettimeofday`**：Linux系统调用，获取当前时间（精确到微秒 `usec`），用于计算分区总耗时；
+- **`radix_partition_without_buffers`**：无缓冲基数分区核心函数（定义在 `RadixPartitioning.cpp`），需重点拆解其内部逻辑（见下文“函数细节”）。
+
+
+#### 4. 打印耗时与结果校验
+```cpp
+cout << time_difference(start_time, end_time) << endl;  // 打印分区总耗时（秒）
+check_partioned_output(output, histogram);              // 校验分区结果正确性
+cout << endl;
+munmap(output, ELEMS * sizeof(Tuple));                  // 释放output内存（对应mmap分配）
+```
+- **`time_difference` 函数**：计算两个 `timeval` 结构体的时间差（单位：秒）：
+  ```cpp
+  double time_difference(struct timeval& first, struct timeval& second) {
+      // 总微秒数 = 秒差*1e6 + 微秒差，再转换为秒
+      double total_time = (second.tv_sec-first.tv_sec)*1000000+(second.tv_usec-first.tv_usec);
+      return total_time/1000000;
+  }
+  ```
+- **`check_partioned_output`**：校验分区结果（见下文“校验逻辑”）；
+- **`munmap`**：释放 `mmap` 分配的内存（不可用 `free`，因 `output` 来自 `mmap` 而非堆）。
+
+
+### 三、核心函数细节拆解
+#### 1. `radix_partition_without_buffers`（无缓冲基数分区逻辑）
+该函数实现“两阶段基数分区”，无中间缓冲区，直接基于输入 `input` 和输出 `output` 操作，定义在 `RadixPartitioning.cpp`：
+
+##### 阶段1：统计每个分区的元素数量（构建直方图）
+```cpp
+constexpr UInt shift = 32 - log2partitions();  // 计算键的移位量（log2partitions()为N_PARTITIONS的对数，如N=256则为8）
+__attribute__((aligned(64))) Index *final_buckets;
+(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));  // 64字节对齐的桶计数器
+memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));  // 初始化计数器为0
+
+// 遍历所有输入元素，统计每个桶的元素数
+for(Index j = 0; j < ELEMS; ++j){
+    ++final_buckets[GET_BUCKET(input[j].value, shift)];
+}
+```
+- **`shift` 计算**：假设 `Tuple.value` 为32位 `UInt`，`log2partitions()` 是分区数的2对数（如 `N_PARTITIONS=256` 则为8），则 `shift=32-8=24`。作用是提取 `value` 的高8位作为“桶编号”（`GET_BUCKET` 宏的核心）。
+- **`GET_BUCKET` 宏**（未直接给出，基于上下文推断）：
+  ```cpp
+  #define GET_BUCKET(key, shift) ((key) >> (shift)) & ((1 << log2partitions()) - 1)
+  ```
+  例如：`key=0x12345678`，`shift=24`，则 `key>>24=0x12`，与 `0xFF`（256分区的掩码）按位与，得到桶编号 `0x12`（18）。
+- **`final_buckets`**：临时桶计数器（64字节对齐），存储每个分区的元素总数。
+
+
+##### 阶段2：计算每个分区的输出起始地址（直方图前缀和）
+```cpp
+for(Index i = 1; i < N_PARTITIONS; ++i){
+    final_buckets[i] += final_buckets[i - 1];  // 前缀和：final_buckets[i] = 前i个桶的元素总数
+}
+memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));  // 结果写入histogram
+```
+- **前缀和作用**：`final_buckets[i]` 表示“第i个桶的最后一个元素在 `output` 中的索引+1”。例如：
+  - 桶0有100个元素，桶1有200个元素，则 `final_buckets[0]=100`（桶0的元素占 `output[0..99]`），`final_buckets[1]=300`（桶1的元素占 `output[100..299]`）。
+
+
+##### 阶段3：将输入元素写入输出的对应分区（逆序写入）
+```cpp
+__attribute__((aligned(64))) Index bucket_num = 0;
+for(Index j = 0; j < ELEMS; ++j){
+    bucket_num = GET_BUCKET(input[j].value, shift);  // 再次计算当前元素的桶编号
+    // 写入output的对应位置：final_buckets[bucket_num]-1 是当前桶的最后一个空位置
+    output[final_buckets[bucket_num] - 1] = input[j];
+    --final_buckets[bucket_num];  // 桶计数器减1，指向下一个空位置（逆序填充）
+}
+free(final_buckets);  // 释放临时计数器内存
+```
+- **逆序写入原因**：前缀和 `final_buckets[i]` 是桶i的“结束索引+1”，从后往前写入可直接定位到空位置，无需额外记录“当前写入位置”（若正序需单独维护每个桶的写入指针，增加内存访问）。
+
+
+#### 2. `check_partioned_output`（分区结果校验逻辑）
+该函数确保每个分区的元素都属于正确的桶，定义在 `Main.cpp`：
+```cpp
+void check_partioned_output(Tuple *output, Index *histogram) {
+#ifdef DEBUG_CHECK  // 仅在编译时定义DEBUG_CHECK宏时执行校验（避免影响性能测试）
+    constexpr UInt shift = shift_distance();  // 与分区时的shift一致（shift_distance()=32-log2partitions()）
+    long long checksum = 0;  // 校验和（辅助验证数据未被篡改）
+    for (Index i = 0; i < N_PARTITIONS; i++) {
+        // 计算当前桶的元素在output中的范围：[start, end)
+        Index start = (i == 0 ? 0 : histogram[i - 1]);  // 桶i的起始索引（桶0从0开始，其他桶从桶i-1的结束索引开始）
+        Index end = histogram[i];                      // 桶i的结束索引（即histogram[i]存储的前缀和）
+        // 遍历桶i的所有元素
+        for (Index j = start; j < end; j++) {
+            // 校验：当前元素的桶编号是否等于i
+            if (GET_BUCKET(output[j].value, shift) != i) {
+                cout << "INCORRECT ===>" << endl;  // 校验失败
+                return;
+            } else {
+                checksum += output[j].value * i;  // 累加校验和（用于二次验证）
+            }
+        }
+    }
+    cout << "Correct !" << endl;  // 校验成功
+    cout << "Checksum " << checksum << endl;  // 打印校验和（可用于对比不同测试用例的一致性）
+#endif
+}
+```
+- **校验核心**：遍历每个分区的元素，验证其 `value` 字段计算出的桶编号是否与当前分区编号一致，确保“分区不跨桶”。
+- **`DEBUG_CHECK` 宏**：控制是否启用校验（性能测试时通常关闭，避免校验逻辑占用时间）。
+
+
+### 四、`UNBUFFERED_4KB_PAGE` 测试的核心特点与目的
+1. **4KB普通页**：通过 `mmap` 分配普通内存页，用于对比“大页（如2MB）”与普通页的性能差异（大页可减少TLB miss，提升内存访问效率）；
+2. **无缓冲**：直接将输入元素写入输出数组，不使用中间缓冲区（对比“带缓冲区”的版本，分析缓冲区对CPU缓存利用率的影响）；
+3. **单线程**：所有操作在单个线程内执行，排除多线程同步开销，专注于内存访问模式（如对齐、TLB）和分区算法本身的性能。
+
+
+### 五、关键宏定义依赖（需在编译时指定）
+要使 `UNBUFFERED_4KB_PAGE` 分支生效，编译时需通过 `-D` 选项定义以下宏（示例Makefile片段）：
+```makefile
+CXXFLAGS += -DUNBUFFERED_4KB_PAGE -DELEMS=1048576 -DN_PARTITIONS=256 -DTOTAL_RUNS=3 -DDEBUG_CHECK
+```
+- `ELEMS=1048576`：输入元素总数（1024*1024=100万）；
+- `N_PARTITIONS=256`：分区数（2的8次幂，对应 `log2partitions()=8`）；
+- `TOTAL_RUNS=3`：测试总轮数；
+- `DEBUG_CHECK`：启用结果校验（可选，性能测试时建议关闭）。
+
+
+通过以上流程，`UNBUFFERED_4KB_PAGE` 分支完成了“4KB普通页无缓冲基数分区”的性能测试与正确性验证，为后续对比其他版本（如2MB大页、带缓冲区、AVX指令优化）提供了基准数据。
+
+
+***********************************************
+这段代码主要定义了两个内存分配函数 `malloc_huge_transparent` 和 `malloc_huge`，用于在 Linux 系统上分配特殊属性的内存（尤其是大页内存），并通过宏定义处理不同系统的兼容性。下面逐部分详细解释：
+
+
+### 一、兼容性宏定义：`MAP_ANONYMOUS` 与 `MAP_ANON`
+```cpp
+#ifndef MAP_ANONYMOUS
+# define MAP_ANONYMOUS MAP_ANON
+#endif
+```
+- **作用**：处理不同 Unix-like 系统对“匿名映射”标志的命名差异。
+- **细节**：
+  - `MAP_ANONYMOUS` 和 `MAP_ANON` 都是 `mmap` 系统调用的标志，用于创建“匿名映射”（即不关联任何文件的内存映射，类似堆内存，但由内核直接管理）。
+  - 两者功能完全相同，但命名因系统而异：
+    - Linux 通常支持 `MAP_ANONYMOUS`；
+    - 某些系统（如早期 BSD）可能仅支持 `MAP_ANON`。
+  - 宏定义逻辑：如果当前系统未定义 `MAP_ANONYMOUS`，则将其定义为 `MAP_ANON`，确保代码在不同系统上都能正确使用匿名映射。
+
+
+### 二、`malloc_huge_transparent` 函数：透明大页内存分配
+```cpp
+void* malloc_huge_transparent(size_t size) {
+    // 调用mmap创建匿名映射，权限为可读可写，私有映射，不预留交换空间
+    void* p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
+    if(!p) {  // 检查内存分配是否失败
+        std::cout << "Out of memory" << std::endl;
+        exit(1);
+    }
+    #ifndef __MACH__  // 排除 macOS 系统（__MACH__ 是 macOS 的预定义宏）
+        // 提示内核优先使用大页内存（透明大页，由内核自动管理）
+        madvise(p, size, MADV_HUGEPAGE);
+        // 提示内核该内存将被顺序访问（优化缓存和预读策略）
+        madvise(p, size, MADV_SEQUENTIAL);
+    #endif
+    return p;
+}
+```
+
+#### 关键参数与调用解析：
+1. **`mmap` 系统调用**：
+   - 功能：创建内存映射，此处用于分配一块新的内存区域（类似 `malloc`，但更底层）。
+   - 参数：
+     - `NULL`：让内核自动选择映射的起始地址；
+     - `size`：分配的内存大小（字节）；
+     - `PROT_READ|PROT_WRITE`：内存权限为“可读可写”；
+     - `MAP_PRIVATE`：私有映射（修改不会影响其他进程）；
+     - `MAP_ANONYMOUS`：匿名映射（不关联文件）；
+     - `MAP_NORESERVE`：不预留交换空间（减少内存 overhead，但内存不足时可能触发 OOM）；
+     - `-1, 0`：匿名映射无需关联文件，因此文件描述符和偏移量无效。
+
+2. **`madvise` 系统调用**：
+   - 功能：向内核提供内存使用的“建议”，帮助内核优化内存管理策略（非强制，但通常能提升性能）。
+   - `MADV_HUGEPAGE`：建议内核使用“透明大页”（Transparent Huge Pages, THP）。大页（如2MB）相比普通页（4KB）可减少 TLB（地址转换缓存）的 miss 率，提升内存访问效率，由内核自动管理大页的分配与释放。
+   - `MADV_SEQUENTIAL`：建议内核该内存区域将被“顺序访问”（如数组遍历）。内核会优化预读策略（提前加载后续内存块），提升访问速度。
+
+3. **`#ifndef __MACH__`**：
+   - `__MACH__` 是 macOS 系统的预定义宏。由于 macOS 对 `MADV_HUGEPAGE` 支持有限，此处排除 macOS，避免编译或运行错误。
+
+
+### 三、`malloc_huge` 函数：指定页大小的内存分配（4KB/2MB/1GB）
+```cpp
+#if defined(UNBUFFERED_4KB_PAGE) || defined(UNBUFFERED_2MB_PAGE)
+void* malloc_huge(size_t size) {
+    #ifndef MAP_HUGE_1GB
+    # define MAP_HUGE_1GB (30 << 26)  // 定义1GB大页的标志（Linux特定）
+    #endif
+    
+    // 根据宏定义选择不同的mmap标志（FLAGS），指定页大小
+    #ifdef UNBUFFERED_4KB_PAGE
+        #define FLAGS  MAP_PRIVATE|MAP_ANONYMOUS  // 普通4KB页
+    #elif defined(UNBUFFERED_2MB_PAGE)
+        #define FLAGS  MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB  // 2MB大页
+    #elif defined(UNBUFFERED_1G_PAGE)
+        #define FLAGS  MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB|MAP_HUGE_1GB  // 1GB大页
+    #else
+        std::cout << "Please set page size." << std::endl;
+        return NULL;
+    #endif
+    
+    // 调用mmap分配内存，使用上面定义的FLAGS
+    void* p = mmap(NULL, size, PROT_READ|PROT_WRITE, FLAGS, -1, 0);
+    if(!p || p == MAP_FAILED) {  // 检查分配失败（mmap失败返回MAP_FAILED，而非NULL）
+        std::cout << "Out of memory" << std::endl;
+        exit(1);
+    }
+    return p;
+}
+#endif
+```
+
+#### 关键解析：
+1. **条件编译**：
+   - 仅当定义了 `UNBUFFERED_4KB_PAGE` 或 `UNBUFFERED_2MB_PAGE` 时，该函数才会被编译（与主程序中的测试分支对应）。
+
+2. **大页标志定义**：
+   - `MAP_HUGE_1GB`：Linux 系统中用于指定 1GB 大页的标志（30 << 26 是内核约定的值，对应页大小为 2^30 字节 = 1GB）。若系统未预定义，此处手动定义。
+
+3. **`FLAGS` 宏的选择**：
+   - 不同宏对应不同的页大小：
+     - `UNBUFFERED_4KB_PAGE`：`FLAGS = MAP_PRIVATE|MAP_ANONYMOUS` → 使用 **4KB普通页**（默认页大小）；
+     - `UNBUFFERED_2MB_PAGE`：`FLAGS` 增加 `MAP_HUGETLB` → 使用 **2MB大页**（HugeTLB 机制，需系统预先配置大页支持）；
+     - `UNBUFFERED_1G_PAGE`：`FLAGS` 再增加 `MAP_HUGE_1GB` → 使用 **1GB大页**（更大的页，适合超大规模内存分配）。
+
+4. **`mmap` 失败检查**：
+   - `mmap` 失败时返回 `MAP_FAILED`（通常是 `(void*)-1`），而非 `NULL`，因此需同时检查 `!p` 和 `p == MAP_FAILED`。
+
+
+### 四、总结：两个函数的核心区别与用途
+| 函数 | 核心特点 | 适用场景 |
+|------|----------|----------|
+| `malloc_huge_transparent` | 使用“透明大页”（内核自动管理大页），并提示顺序访问优化 | 希望内核自动优化页大小，无需手动配置大页的场景 |
+| `malloc_huge` | 强制使用指定大小的页（4KB/2MB/1GB），依赖 `MAP_HUGETLB` 等标志 | 需要精确控制页大小（如性能测试中对比不同页大小的影响），需系统预先配置对应大页 |
+
+这两个函数均通过 `mmap` 而非 `malloc` 分配内存，原因是 `mmap` 可直接控制内存页的属性（如大页、匿名映射等），更适合底层性能测试场景（如代码中的基数分区性能对比）。
+**********************************************************
+你提到：“UNBUFFERED_2MB_PAGE：FLAGS 增加 MAP_HUGETLB → 使用 2MB 大页（HugeTLB 机制，需系统预先配置大页支持）；”，请问是只有透明大页才需要提前修改系统配置么？修改系统配置是系统所有进程都会受到影响么
+
+不是只有透明大页（THP）需要系统配置，**HugeTLB 大页（如 2MB、1GB 页）同样需要提前配置系统参数**，但两者的配置方式和影响范围不同。下面详细说明：
+
+
+### 一、透明大页（Transparent Huge Huge Pages, THP）的配置
+透明大页是内核自动管理的大页机制，无需用户手动分配大页，内核会根据内存访问模式动态将普通页合并为大页（通常 2MB）。
+
+#### 1. 需要的系统配置
+默认情况下，多数 Linux 发行版会启用透明大页，但可通过以下方式修改配置：
+```bash
+# 查看当前状态（[always] 表示启用，[never] 表示禁用）
+cat /sys/kernel/mm/transparent_hugepage/enabled
+
+# 临时启用/禁用（重启失效）
+echo always > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+
+# 永久生效（需修改系统配置文件，如 /etc/default/grub，添加内核参数）
+# 禁用：transparent_hugepage=never
+# 启用：transparent_hugepage=always
+```
+
+#### 2. 对系统进程的影响
+- **全局生效**：配置修改后，所有进程的内存分配都会受到影响（内核会自动为符合条件的内存区域使用大页）。
+- **非强制**：内核会根据内存碎片情况动态决定是否使用大页，进程无法直接指定“必须使用透明大页”。
+
+
+### 二、HugeTLB 大页的配置
+HugeTLB 是用户手动预分配的大页机制，需要提前向内核“预留”固定数量的大页（如 2MB 或 1GB），进程通过特定标志（如 `MAP_HUGETLB`）显式申请使用。
+
+#### 1. 需要的系统配置（关键步骤）
+- **1. 确认系统支持的大页大小**：
+  ```bash
+  # 查看系统支持的大页尺寸（常见 2MB、1GB）
+  grep Hugepagesize /proc/meminfo
+  ```
+
+- **2. 预留大页（临时生效）**：
+  ```bash
+  # 预留 100 个 2MB 大页（需要 root 权限）
+  echo 100 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # 预留 2 个 1GB 大页（仅部分服务器支持）
+  echo 2 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+  ```
+
+- **3. 永久预留大页**：
+  通过内核参数设置（如 `/etc/default/grub`），重启后生效：
+  ```bash
+  # 预留 100 个 2MB 大页
+  GRUB_CMDLINE_LINUX="hugepages=100 default_hugepagesz=2M"
+  ```
+
+- **4. 挂载大页文件系统（可选）**：
+  部分应用通过文件系统接口使用大页，需挂载 `hugetlbfs`：
+  ```bash
+  mkdir /mnt/huge
+  mount -t hugetlbfs nodev /mnt/huge
+  ```
+
+#### 2. 对系统进程的影响
+- **仅显式使用的进程受影响**：
+  预留的大页仅分配给使用 `MAP_HUGETLB` 标志申请内存的进程（如代码中的 `UNBUFFERED_2MB_PAGE` 分支），其他进程仍使用普通 4KB 页。
+- **资源隔离**：
+  预留的大页数量是固定的，不会被其他进程占用，适合对性能敏感的场景（如数据库、高性能计算）。
+- **全局资源限制**：
+  预留的大页会占用系统物理内存，其他进程无法使用这部分内存，因此需根据实际需求配置（预留过多会导致内存浪费）。
+
+
+### 三、核心区别总结
+| 特性                | 透明大页（THP）                     | HugeTLB 大页                        |
+|---------------------|-------------------------------------|-------------------------------------|
+| 配置方式            | 内核参数动态开关（无需预分配）       | 需提前预留固定数量的大页            |
+| 进程使用方式        | 内核自动管理，进程无感知            | 进程需显式使用 `MAP_HUGETLB` 标志   |
+| 对系统的影响范围    | 全局生效（所有进程可能受益）        | 仅显式使用的进程受影响              |
+| 灵活性              | 高（动态调整，适应内存碎片）        | 低（预分配固定数量，不灵活）        |
+| 适用场景            | 通用场景（如普通应用、减少 TLB  miss） | 高性能场景（如数据库、低延迟服务）  |
+
+
+### 结论
+- **透明大页**：配置是全局的，影响所有进程，但无需预分配，适合通用场景。
+- **HugeTLB 大页**：配置是预分配固定资源，仅显式使用的进程受影响，适合对性能有严格要求的场景。
+
+两种大页机制都需要系统配置，但影响范围和使用方式不同，需根据实际需求选择。
+
+*************************************************************************
+要理解 `UNBUFFERED_PREFETCHED` 情况下的测试逻辑，需从 **`main` 函数中的分支入口** 切入，逐步拆解「内存分配→基数分区执行→结果校验→资源释放」全流程，并结合对应的分区实现函数 `radix_partition_without_buffers_prefetched` 解析其核心优化（无缓冲区+预取）。
+
+
+### 一、先明确前置依赖：关键宏与数据结构
+在分析代码前，需先明确几个核心定义（来自头文件 `Macros.h`/`Types.h`，代码中未显式给出但可推导）：
+| 宏/类型         | 含义推导                                                                 |
+|-----------------|--------------------------------------------------------------------------|
+| `UNBUFFERED_PREFETCHED` | 编译开关：启用「无缓冲区+预取优化」的基数分区测试                        |
+| `Tuple`         | 数据元组结构，代码中含 `rowId` 和 `value` 两个 `UInt` 字段（共 8 字节）  |
+| `Index`         | 索引类型，通常为 `size_t`（64 位系统下 8 字节），用于计数和内存偏移       |
+| `N_PARTITIONS`  | 基数分区的「桶数量」，需为 2 的幂（如 256、1024），由 `log2partitions()` 推导 |
+| `ELEMS`         | 测试数据总量（如 1000 万），全局常量                                     |
+| `shift_distance()` | 计算基数分区的「位移量」，用于从 `Tuple.value` 中提取「桶编号」（如 `32 - log2(N_PARTITIONS)`） |
+
+
+### 二、`main` 函数中 `UNBUFFERED_PREFETCHED` 分支的逐行解析
+该分支位于 `main` 函数的循环体内（每个 `TOTAL_RUNS` 迭代都会执行），核心是「分配内存→执行分区→计时→校验→释放」，具体代码与解释如下：
+
+```cpp
+#ifdef UNBUFFERED_PREFETCHED  // 1. 编译开关：仅当定义UNBUFFERED_PREFETCHED时执行此分支
+{
+    // 2. 分配输出内存：64字节对齐，大小为ELEMS个Tuple（避免缓存行拆分，提升访问效率）
+    (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));
+    
+    // 3. 定义直方图：用于记录每个桶的元素数量，64字节对齐（适配CPU缓存）
+    __attribute__((aligned(64))) Index histogram[N_PARTITIONS];
+    
+    // 4. 打印测试信息：说明当前执行的分区类型和Tuple大小
+    cout << "Starting Single Threaded Radix Partition Unbuffered, Prefetched and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;
+    
+    // 5. 记录分区开始时间
+    gettimeofday(&start_time, NULL);
+    
+    // 6. 核心调用：执行「无缓冲区+预取优化」的基数分区
+    radix_partition_without_buffers_prefetched(input, output, histogram);
+    
+    // 7. 记录分区结束时间
+    gettimeofday(&end_time, NULL);
+    
+    // 8. 计算并打印分区耗时（秒为单位）
+    cout << time_difference(start_time, end_time) << endl;
+    
+    // 9. 校验分区结果是否正确
+    check_partioned_output(output, histogram);
+    
+    // 10. 打印空行，分隔不同测试分支的输出
+    cout << endl;
+    
+    // 11. 释放输出内存（posix_memalign分配的内存需用free释放，与malloc兼容）
+    free(output);
+}
+#endif
+```
+
+
+#### 关键步骤详解（为什么这么写？）
+1. **`posix_memalign` 内存分配**：  
+   - 普通 `malloc` 无法保证内存对齐，而 `posix_memalign` 强制 `output` 地址为 **64 字节对齐**（CPU 缓存行常见大小）。  
+   - 目的：避免 `Tuple` 数据跨缓存行存储（“缓存行拆分”），减少 CPU 缓存访问的 miss 率，提升内存读写效率。
+
+2. **`__attribute__((aligned(64)))` 直方图对齐**：  
+   - `histogram` 用于统计每个桶的元素数量，是分区过程中的高频访问变量（每次处理一个 `Tuple` 都需更新）。  
+   - 64 字节对齐确保 `histogram` 完全存放在 CPU 缓存中，避免访问时的缓存 miss。
+
+3. **`gettimeofday` 计时**：  
+   - 比 `clock()` 更精准（可到微秒级），用于测量基数分区的纯执行时间（排除内存分配/打印等耗时）。
+
+
+### 三、核心函数：`radix_partition_without_buffers_prefetched` 逐行解析
+该函数是 `UNBUFFERED_PREFETCHED` 分支的核心，实现「无缓冲区+预取优化」的基数分区，分为 **3 个阶段**：**桶计数→桶边界计算→数据分区（带预取）**。
+
+```cpp
+#ifdef UNBUFFERED_PREFETCHED  // 编译开关：仅当启用时编译此函数
+void radix_partition_without_buffers_prefetched(Tuple *input, Tuple *output, Index *histogram) {
+    // 阶段1：初始化参数与内存
+    constexpr UInt shift = shift_distance();  // 1. 计算位移量：从value中提取桶编号的关键
+    __attribute__((aligned(64))) Index *final_buckets;  // 2. 桶计数器（最终用于计算输出地址）
+
+    // 3. 分配final_buckets：64字节对齐，大小为(N_PARTITIONS + 1)个Index（多1个用于边界计算）
+    (void)posix_memalign((void**)&final_buckets, 64, (N_PARTITIONS + 1) * sizeof(Index));
+    // 4. 初始化final_buckets为0（所有桶的初始计数为0）
+    memset(final_buckets, 0, (N_PARTITIONS + 1) * sizeof(Index));
+
+    // 阶段2：桶计数（统计每个桶有多少个元素）
+    final_buckets++;  // 5. 指针偏移：让final_buckets[0]对应原数组的[1]，简化后续边界计算
+    for(Index j = 0; j < ELEMS; ++j){  // 6. 遍历所有输入Tuple
+        // 7. 提取当前Tuple的桶编号：GET_BUCKET是宏，通过位移+掩码实现（如 (value >> shift) & (N_PARTITIONS-1)）
+        ++final_buckets[GET_BUCKET(input[j].value, shift)];
+    }
+
+    // 阶段3：计算桶的输出边界（前缀和）
+    final_buckets--;  // 8. 指针回退：恢复final_buckets指向原数组的起始地址
+    for(Index i = 1; i <= N_PARTITIONS; ++i){  // 9. 计算前缀和：final_buckets[i] = 前i个桶的总元素数
+        final_buckets[i] += final_buckets[i - 1];
+    }
+
+    // 10. 复制桶边界到histogram：供main函数中的校验函数使用（判断每个桶的元素范围）
+    memcpy(histogram, final_buckets + 1, N_PARTITIONS * sizeof(Index));
+
+    // 阶段4：数据分区（核心，带预取优化）
+    __attribute__((aligned(64))) Index bucket_num = 0;  // 11. 当前Tuple所属的桶编号
+    for(Index j = 0; j < ELEMS; ++j){  // 12. 遍历所有输入Tuple，写入输出数组
+        // 13. 提取当前Tuple的桶编号
+        bucket_num = GET_BUCKET(input[j].value, shift);
+        // 14. 将输入Tuple写入输出数组的对应桶位置：final_buckets[bucket_num]是当前桶的下一个写入地址
+        output[final_buckets[bucket_num]++] = input[j];
+        
+        // 15. 预取优化：__builtin_prefetch是GCC内置函数，提前加载下一个要写入的内存到CPU缓存
+        // 参数说明：
+        // - output + final_buckets[bucket_num]：预取地址（下一个要写入的位置）
+        // - 1：表示“写预取”（告诉CPU这部分内存后续会被写入）
+        // - 0：预取到L1缓存（最高优先级，最快访问）
+        __builtin_prefetch(output + final_buckets[bucket_num], 1, 0);
+    }
+
+    // 阶段5：释放临时内存（final_buckets是posix_memalign分配的，需free）
+    free(final_buckets);
+}
+#endif
+```
+
+
+#### 核心优化点解析
+1. **无缓冲区（Unbuffered）**：  
+   - 传统基数分区可能用“临时缓冲区”先缓存每个桶的元素，最后再合并到输出数组；而此函数直接将 `input` 写入 `output` 的目标位置（通过 `final_buckets` 记录每个桶的写入地址）。  
+   - 优势：减少一次内存拷贝（无缓冲区→输出的二次拷贝），降低内存带宽占用，提升速度。
+
+2. **预取（Prefetched）**：  
+   - 问题：CPU 访问内存的速度远慢于执行指令（“内存墙”），当执行 `output[final_buckets[bucket_num]++] = input[j]` 时，若 `output` 的目标地址不在缓存中，CPU 会等待内存加载（“缓存 miss”），浪费 cycles。  
+   - 解决：`__builtin_prefetch` 提前 1~2 个指令周期，将 **下一个要写入的 `output` 地址** 加载到 L1 缓存。当 CPU 真正执行写入时，数据已在缓存中，无需等待内存，大幅减少等待时间。
+
+
+### 四、结果校验：`check_partioned_output` 函数解析
+`main` 函数中调用 `check_partioned_output(output, histogram)` 验证分区结果是否正确，确保每个桶的元素都属于该桶（无错分），代码如下：
+
+```cpp
+void check_partioned_output(Tuple *output, Index *histogram) {
+#ifdef DEBUG_CHECK  // 仅当定义DEBUG_CHECK时执行校验（避免测试时的性能开销）
+    constexpr UInt shift = shift_distance();  // 与分区时一致的位移量，确保桶编号提取逻辑相同
+    long long checksum = 0;  // 校验和：用于二次验证（即使桶编号正确，数据内容也可能错，需校验和确认）
+
+    // 遍历每个桶，检查桶内所有元素的桶编号是否正确
+    for (Index i = 0; i < N_PARTITIONS; i++) {
+        // 计算当前桶的元素范围：
+        // - start：当前桶的起始地址（第0个桶从0开始，其他桶从前一个桶的结束地址开始）
+        // - end：当前桶的结束地址（histogram[i]是当前桶的总元素数，即结束地址）
+        Index start = (i == 0 ? 0 : histogram[i - 1]);
+        Index end = histogram[i];
+
+        // 遍历当前桶的所有元素
+        for (Index j = start; j < end; j++) {
+            // 检查当前元素的桶编号是否等于当前桶ID（i）
+            if (GET_BUCKET(output[j].value, shift) != i) {
+                cout << "INCORRECT ===>" << endl;  // 错分：打印错误并返回
+                return;
+            } else {
+                checksum += output[j].value * i;  // 正确：累加校验和（避免数据篡改）
+            }
+        }
+    }
+
+    // 所有元素检查通过，打印结果
+    cout << "Correct !" << endl;
+    cout << "Checksum " << checksum << endl;
+#endif
+}
+```
+
+
+#### 校验逻辑的意义
+1. **桶编号校验**：确保每个 `output[j]` 的 `value` 提取出的桶编号，与它所在的桶 ID（`i`）一致，无错分。  
+2. **校验和校验**：即使桶编号正确，若 `output` 数据被意外篡改（如内存越界写入），校验和会与预期不符，进一步确保数据完整性。  
+3. **`DEBUG_CHECK` 开关**：校验过程会遍历所有元素（耗时），因此通过宏控制——测试阶段启用（验证正确性），性能测试阶段禁用（避免影响耗时统计）。
+
+
+### 五、整体流程总结（`UNBUFFERED_PREFETCHED` 分支）
+1. **内存准备**：用 `posix_memalign` 分配 64 字节对齐的 `output` 内存，避免缓存行拆分。  
+2. **计时开始**：记录 `start_time`，确保仅统计分区核心耗时。  
+3. **基数分区**：  
+   - 桶计数：统计每个桶的元素数量。  
+   - 边界计算：用前缀和确定每个桶在 `output` 中的地址范围。  
+   - 数据写入：直接将 `input` 写入 `output` 对应位置，并用 `__builtin_prefetch` 预取下一个写入地址，减少缓存 miss。  
+4. **计时结束**：计算并打印分区耗时。  
+5. **结果校验**：检查桶编号正确性和数据完整性。  
+6. **资源释放**：`free(output)` 释放内存，避免内存泄漏。
+
+
+该分支的核心目标是 **在“无缓冲区”减少内存拷贝的基础上，通过“预取”突破内存墙限制**，是对基数分区算法的高性能优化实现，常用于数据库、大数据等需要高频数据分区的场景。
+**********************************************************************
+请解释下__builtin_prefetch(output + final_buckets[bucket_num], 1, 0);的函数参数
+`__builtin_prefetch` 是 GCC 编译器提供的内置函数，用于在代码执行到特定位置时，提前将指定内存地址的数据加载到 CPU 缓存中，从而减少后续访问该内存时的缓存未命中（cache miss）开销。
+
+在代码 `__builtin_prefetch(output + final_buckets[bucket_num], 1, 0);` 中，三个参数的含义如下：
+
+
+### 1. 第一个参数：`output + final_buckets[bucket_num]`
+- **含义**：需要预取的内存地址。
+- **解析**：  
+  这里的地址是「下一个将要写入 `output` 数组的位置」。  
+  - `final_buckets[bucket_num]` 表示当前桶（`bucket_num`）的下一个写入索引（已通过 `++` 自增）。  
+  - `output + final_buckets[bucket_num]` 即该索引对应的内存地址。  
+  预取该地址的目的是：提前将下一次要写入的数据所在的缓存行加载到 CPU 缓存，避免真正写入时等待内存加载。
+
+
+### 2. 第二个参数：`1`
+- **含义**：预取的目的（读写方向），`1` 表示「该内存后续会被写入」，`0` 表示「该内存后续会被读取」（默认值）。
+- **解析**：  
+  基数分区中，`output` 数组是用于「写入」结果的，因此传入 `1` 告诉 CPU：这部分内存即将被修改。  
+  CPU 会根据这个信息优化缓存策略（例如，避免将预取的数据标记为“只读”，或优先保留在写缓冲区中）。
+
+
+### 3. 第三个参数：`0`
+- **含义**：预取的缓存级别（优先级），取值范围为 `0~3`，数值越小表示缓存级别越高（优先级越高）。
+  - `0`：预取到 L1 缓存（最快，容量最小）。  
+  - `1`：预取到 L2 缓存。  
+  - `2`：预取到 L3 缓存（仅多核处理器有，容量最大，速度较慢）。  
+  - `3`：预取到主存附近（不加载到缓存，通常不推荐）。
+- **解析**：  
+  这里传入 `0` 表示优先将数据预取到 L1 缓存。由于 `output` 是高频写入的内存（每个元素都会被写入一次），L1 缓存的访问速度最快（纳秒级），能最大程度减少写入等待时间。
+
+
+### 总结
+这行代码的作用是：**提前将下一个要写入 `output` 的内存地址加载到 L1 缓存，因为后续马上要对该地址执行写入操作**。通过这种“预加载”，可以掩盖内存访问的延迟（CPU 无需等待数据从主存加载到缓存），从而提升基数分区的整体性能。
+*******************************************************************
+你的观察非常敏锐！在 `radix_partition_without_buffers_prefetched` 函数中，`__builtin_prefetch(output + final_buckets[bucket_num], 1, 0)` 确实是预取「当前桶的下一个写入地址」，但这并不依赖于「下一个元素是否属于该分区」。这种预取策略的合理性，需要结合基数分区的特性和 CPU 缓存的工作方式来理解：
+
+
+### 1. 预取的是「当前桶的下一个空位」，而非「下一个元素的目标位置」
+- 代码中，`final_buckets[bucket_num]` 表示 **当前桶（`bucket_num`）的下一个可用写入索引**（已通过 `++` 自增）。  
+- 预取的 `output + final_buckets[bucket_num]` 是「当前桶即将要写入的下一个位置」，无论下一个元素属于哪个桶，这个地址都是当前桶的“空位”。  
+
+例如：假设当前处理的元素属于桶 3，`final_buckets[3]` 为 100，则预取 `output[100]`（桶 3 的下一个写入位置）。即使下一个元素属于桶 5，桶 3 的 `final_buckets[3]` 仍为 100，预取的 `output[100]` 是桶 3 未来可能用到的空位。
+
+
+### 2. 为什么不依赖「下一个元素的分区」？
+- **下一个元素的分区未知**：基数分区中，元素的桶编号由 `value` 决定（随机或无序），无法提前预测下一个元素属于哪个桶。如果等待确定下一个元素的桶编号再预取，会错过预取的最佳时机（预取需要时间，需提前 1~2 个指令周期触发）。  
+- **预取是“猜测性”的，允许冗余**：CPU 缓存容量有限，但预取冗余数据（即使后续未使用）的代价远低于缓存未命中（cache miss）的代价。例如，预取了桶 3 的空位但下一个元素属于桶 5，最多只是占用一点缓存空间，而若不预取，当桶 3 再次有元素写入时，必然会等待内存加载，耗时更长。  
+
+
+### 3. 这种预取策略的合理性：局部性原理
+基数分区中，虽然元素的桶编号是随机的，但 **同一个桶的元素会被集中写入连续的内存区域**（`output` 中每个桶的空间是连续的）。因此：  
+- 当一个元素写入桶 `k` 后，短期内很可能有另一个元素也写入桶 `k`（概率上的局部性）。  
+- 预取桶 `k` 的下一个空位，能大概率命中后续写入操作，有效减少缓存未命中。  
+
+即使偶尔预取了“无用”地址（后续没有元素写入该桶），也不会影响正确性，且性能损失远小于“有用预取”带来的收益。
+
+
+### 总结
+`__builtin_prefetch` 预取的是「当前桶的下一个空位」，而非「下一个元素的目标位置」。这种策略不依赖于对下一个元素的预测，而是基于「同一个桶的元素会连续写入」的局部性原理，通过“猜测性预取”平衡性能和复杂度。即使预取偶尔“失效”（下一个元素不属于当前桶），其代价也远低于缓存未命中的损失，因此是基数分区中一种高效的优化手段。
+***********************************************************************
+在 `radix_partition_without_buffers_prefetched` 函数中，`final_buckets` 分配为 `(N_PARTITIONS + 1)` 个元素，而 `radix_partition_without_buffers` 仅分配 `N_PARTITIONS` 个元素，核心原因是两者计算「桶边界（前缀和）」的逻辑不同，多出来的 1 个元素是为了简化指针操作和边界计算。
+
+
+### 具体差异分析：
+#### 1. `radix_partition_without_buffers` 的逻辑（`N_PARTITIONS` 个元素）：
+- **桶计数阶段**：`final_buckets[i]` 直接存储第 `i` 个桶的元素数量（`i` 范围 `0~N_PARTITIONS-1`）。
+- **前缀和计算**：  
+  ```cpp
+  for(Index i = 1; i < N_PARTITIONS; ++i){
+      final_buckets[i] += final_buckets[i - 1];  // 累加前i个桶的总数量
+  }
+  ```
+  最终 `final_buckets[i]` 表示「前 `i+1` 个桶的总元素数」（即第 `i` 个桶的结束地址）。
+- **数据写入**：通过 `final_buckets[bucket_num] - 1` 定位当前桶的最后一个空位（从后往前写），写完后 `final_buckets[bucket_num]--` 调整位置。
+
+
+#### 2. `radix_partition_without_buffers_prefetched` 的逻辑（`N_PARTITIONS + 1` 个元素）：
+- **额外元素的作用**：多出来的 1 个元素（索引 `N_PARTITIONS`）用于简化「前缀和计算」的起始条件。
+- **指针偏移技巧**：  
+  ```cpp
+  final_buckets++;  // 指针偏移：让原数组[1]变为新的[0]，原[0]被“隐藏”
+  // 桶计数：此时final_buckets[0..N_PARTITIONS-1]对应原数组[1..N_PARTITIONS]
+  for(Index j = 0; j < ELEMS; ++j){
+      ++final_buckets[GET_BUCKET(input[j].value, shift)];
+  }
+  final_buckets--;  // 指针回退，恢复原地址
+  ```
+- **前缀和计算**：  
+  ```cpp
+  for(Index i = 1; i <= N_PARTITIONS; ++i){  // 注意循环上限是 <= N_PARTITIONS
+      final_buckets[i] += final_buckets[i - 1];
+  }
+  ```
+  此时：
+  - `final_buckets[0]` 始终为 0（未被桶计数修改）。
+  - `final_buckets[i]`（`1<=i<=N_PARTITIONS`）表示「前 `i` 个桶的总元素数」。
+- **数据写入**：从前往后写，`final_buckets[bucket_num]` 直接作为下一个写入位置（写完后 `++` 调整）。
+
+
+### 为什么需要多 1 个元素？
+1. **统一前缀和的起始条件**：  
+   多出来的 `final_buckets[0]` 固定为 0，使得第 1 个桶（`i=1`）的前缀和计算可以统一为 `final_buckets[1] += final_buckets[0]`，无需单独处理 `i=0` 的特殊情况，简化循环逻辑。
+
+2. **适配「从前往后写」的模式**：  
+   `prefetched` 版本采用「从前往后写入输出数组」的方式（`output[final_buckets[bucket_num]++] = input[j]`），而 `final_buckets[i]` 需要直接表示第 `i-1` 个桶的结束地址（作为下一个写入的起始点）。多 1 个元素可以自然地用 `final_buckets[0] = 0` 作为第 0 个桶的起始地址，后续桶的地址计算连贯无歧义。
+
+3. **避免数组越界**：  
+   当计算最后一个桶（`i=N_PARTITIONS-1`）的前缀和时，`i+1` 会达到 `N_PARTITIONS`，若数组大小为 `N_PARTITIONS` 会越界。多 1 个元素刚好容纳这个计算。
+
+
+### 总结
+`prefetched` 版本通过多分配 1 个元素，配合指针偏移技巧，简化了前缀和计算的逻辑，同时适配了「从前往后写入」的模式，避免了边界条件的特殊处理，使代码更简洁且不易出错。这一设计与该版本的预取优化（需要连续的内存地址预测）相匹配，确保了高效的缓存利用。
+***************************************************************************
+`radix_partition_with_contiguous_buffers` 函数是基于「连续缓存」的基数分区实现，通过为每个分区分配临时缓存，减少对输出数组的随机写入，从而提升性能。以下逐行解释其实现逻辑：
+
+```cpp
+// 带连续缓存的基数分区函数
+// 参数：
+// - input：输入Tuple数组（待分区数据）
+// - output：输出Tuple数组（分区结果）
+// - histogram：输出参数，记录每个分区的元素边界
+// - buffered_tuples：每个分区的缓存大小（满了再刷到output）
+void radix_partition_with_contiguous_buffers(Tuple *input, Tuple *output, Index *histogram, const UInt buffered_tuples) {
+    // 1. 定义基数分区的位移量（由宏shift_distance()计算，如基于32位值的高k位分区）
+    constexpr UInt shift = shift_distance();
+
+    // 2. 声明并分配连续内存（64字节对齐，适配CPU缓存行）
+    __attribute__((aligned(64))) Index *final_buckets;       // 记录每个分区的元素数量及边界
+    __attribute__((aligned(64))) Tuple *buffers;             // 连续缓存区：每个分区占buffered_tuples个位置
+    __attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS]; // 每个分区的缓存计数器（当前缓存了多少元素）
+
+    // 3. 分配final_buckets内存（大小为分区数N_PARTITIONS，64字节对齐）
+    (void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+    memset(final_buckets, 0, N_PARTITIONS * sizeof(Index)); // 初始化为0
+
+    // 4. 分配缓存区buffers（大小为N_PARTITIONS * buffered_tuples，每个分区有buffered_tuples个缓存位置）
+    (void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+    
+    // 5. 初始化缓存计数器（所有分区的缓存计数初始化为0）
+    memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
+
+    // 6. 阶段1：统计每个分区的元素数量（桶计数）
+    for(Index j = 0; j < ELEMS; ++j){
+        // 计算当前Tuple属于哪个分区（GET_BUCKET宏通过位移和掩码实现）
+        ++final_buckets[GET_BUCKET(input[j].value, shift)];
+    }
+
+    // 7. 阶段2：计算分区边界（前缀和）
+    // final_buckets[i] 变为「前i+1个分区的总元素数」（即第i个分区的结束索引）
+    for(Index i = 1; i < N_PARTITIONS; ++i){
+        final_buckets[i] += final_buckets[i - 1];
+    }
+
+    // 8. 将分区边界复制到histogram（供外部校验使用）
+    memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
+
+    // 9. 阶段3：带缓存的数据分区（核心逻辑）
+    __attribute__((aligned(64))) Index bucket_num = 0; // 当前元素所属的分区编号
+    for(Index j = 0; j < ELEMS; ++j){
+        // a. 计算当前Tuple的分区编号
+        bucket_num = GET_BUCKET(input[j].value, shift);
+
+        // b. 计算该分区在缓存中的偏移量（每个分区占buffered_tuples个位置）
+        Index offset = bucket_num * buffered_tuples;
+
+        // c. 将当前Tuple写入缓存的对应位置，并递增缓存计数器
+        buffers[offset + buffer_counters[bucket_num]] = input[j];
+        buffer_counters[bucket_num]++;
+
+        // d. 若缓存已满（达到buffered_tuples），则批量刷入output
+        if (buffer_counters[bucket_num] == buffered_tuples) {
+            // 计算该分区在output中的起始位置（从后往前写，因此先减去缓存大小）
+            final_buckets[bucket_num] -= buffered_tuples;
+            
+            // 将缓存中的数据批量复制到output的对应位置（连续写入，提升缓存效率）
+            memcpy(output + final_buckets[bucket_num], buffers + offset, sizeof(Tuple) * buffered_tuples);
+            
+            // 重置该分区的缓存计数器
+            buffer_counters[bucket_num] = 0;
+        }
+    }
+
+    // 10. 处理缓存中剩余的未刷入数据（不足一个缓存大小的部分）
+    for (Index i = 0; i < N_PARTITIONS; i++) {
+        Index offset = i * buffered_tuples; // 该分区在缓存中的偏移量
+        
+        // 将剩余元素逐个写入output（从分区的结束位置往前写）
+        for (UInt b = 0; b < buffer_counters[i]; b++) {
+            output[final_buckets[i] - 1] = buffers[offset + b];
+            --final_buckets[i]; // 递减分区的当前写入位置
+        }
+    }
+
+    // 11. 释放动态分配的内存
+    free(final_buckets);
+    free(buffers);
+}
+```
+
+### 核心逻辑总结：
+1. **内存分配**：为分区计数（`final_buckets`）、连续缓存（`buffers`）和缓存计数器分配64字节对齐的内存，优化CPU缓存利用率。
+2. **桶计数**：统计每个分区的元素数量，为后续计算边界做准备。
+3. **前缀和计算**：将每个分区的元素数量转换为输出数组中的边界索引（`final_buckets[i]` 表示前i+1个分区的总元素数）。
+4. **带缓存写入**：
+   - 元素先写入对应分区的缓存（`buffers`），而非直接写入`output`。
+   - 当缓存满时，通过`memcpy`批量写入`output`，减少随机IO，提升性能。
+5. **剩余数据处理**：缓存中未填满的元素，在最后逐个写入`output`的对应位置。
+
+该实现通过「缓存+批量写入」减少了对输出数组的随机访问，充分利用CPU缓存的空间局部性，从而提升基数分区的效率。
+
+
+********************************************************
+要理解 `CONTIGUOUS_BUFFERS_PREFETCHED` 编译宏启用时的测试程序逻辑，需从 `main` 函数入口出发，结合「预处理宏控制」「数据初始化」「分区函数调用」「结果校验」等核心环节，逐行拆解其执行流程。以下按代码执行顺序展开详细解释：
+
+
+### 一、前置知识与全局依赖
+在分析 `main` 函数前，需明确几个关键前提：
+1. **编译宏控制**：`CONTIGUOUS_BUFFERS_PREFETCHED` 是编译时宏（需通过编译器参数 `-DCONTIGUOUS_BUFFERS_PREFETCHED` 启用），仅当该宏定义时，对应的分区测试代码块才会被编译执行。
+2. **核心数据结构**：
+   - `Tuple`：待分区的数据结构（含 `rowId` 和 `value` 字段，`value` 作为分区键）。
+   - `Index`：索引类型（通常为 `size_t` 或 `uint64_t`，用于记录数组下标、分区边界）。
+   - `N_PARTITIONS`：宏定义的分区数（如 256、512，需为 2 的幂，适配基数分区的位运算逻辑）。
+   - `ELEMS`：宏定义的输入数据总量（待分区的元素个数）。
+3. **关键函数依赖**：
+   - `radix_partition_with_contiguous_buffers_prefetched`：带预取优化的连续缓存基数分区函数（核心测试对象）。
+   - `check_partioned_output`：校验分区结果正确性的函数。
+   - `posix_memalign`：分配指定对齐（此处为 64 字节，适配 CPU 缓存行）的内存，提升缓存利用率。
+
+
+### 二、main函数整体框架
+`main` 函数的核心逻辑是：**初始化随机输入数据 → 循环执行多轮测试（`TOTAL_RUNS` 次）→ 针对不同分区算法（通过宏控制）执行「内存分配→计时→分区→校验→内存释放」流程**。
+
+以下仅聚焦 `CONTIGUOUS_BUFFERS_PREFETCHED` 对应的代码块，其他宏控制的代码块（如 `UNBUFFERED` `CONTIGUOUS_BUFFERS`）会被跳过。
+
+
+### 三、CONTIGUOUS_BUFFERS_PREFETCHED代码块逐行解释
+首先定位 `main` 函数中 `CONTIGUOUS_BUFFERS_PREFETCHED` 对应的代码块（约 180-200 行，具体行数需结合完整代码），按执行顺序逐行拆解：
+
+
+#### 1. 命令行参数校验（确保缓存大小有效）
+```cpp
+#ifdef CONTIGUOUS_BUFFERS_PREFETCHED
+{
+    if (argc < 2) {  // 1. 检查命令行参数数量
+        cout << "Usage: " << argv[0] << " <BUFFERED_TUPLES>" << endl;
+        return -1;   // 2. 参数不足时退出，返回错误码
+    }
+    const UInt buffered_tuples = (UInt)atoi(argv[1]);  // 3. 解析第2个参数为「每个分区的缓存大小」
+```
+- **逐行解释**：
+  1. `if (argc < 2)`：`argc` 是命令行参数总数（`argv[0]` 为程序名，`argv[1]` 为用户传入的「每个分区缓存元素数」）。若未传入 `BUFFERED_TUPLES`，则参数不足。
+  2. `cout << "Usage: ..."`：打印参数用法提示（告知用户需传入缓存大小，如 `./program 128` 表示每个分区缓存 128 个 `Tuple`）。
+  3. `const UInt buffered_tuples = ...`：将 `argv[1]`（字符串）转为无符号整数 `UInt`，作为「每个分区的临时缓存容量」—— 缓存满时才批量写入输出数组，减少随机 IO，预取优化进一步降低缓存缺失。
+
+
+#### 2. 分配输出数组内存（64字节对齐）
+```cpp
+    (void)posix_memalign((void**)&output, 64, ELEMS * sizeof(Tuple));  // 4. 分配输出数组内存
+```
+- **逐行解释**：
+  - `posix_memalign`：标准 POSIX 函数，功能是分配指定对齐的内存，参数含义：
+    - `(void**)&output`：输出参数，指向分配的内存地址（`output` 是存储分区结果的数组）。
+    - `64`：内存对齐字节数（CPU 缓存行通常为 64 字节，对齐后可避免「缓存行分裂」，提升访问效率）。
+    - `ELEMS * sizeof(Tuple)`：分配的总内存大小（需存储所有 `ELEMS` 个 `Tuple` 元素）。
+  - `(void)` 强制转换：抑制 `posix_memalign` 返回值（成功返回 0，失败返回错误码）的未使用警告（实际工程中建议检查返回值，此处为简化测试省略）。
+
+
+#### 3. 初始化分区边界数组（histogram）
+```cpp
+    __attribute__((aligned(64))) Index histogram[N_PARTITIONS];  // 5. 定义分区边界数组（64字节对齐）
+```
+- **逐行解释**：
+  - `__attribute__((aligned(64)))`：GCC 编译器扩展，指定数组 `histogram` 按 64 字节对齐，确保访问时命中 CPU 缓存。
+  - `Index histogram[N_PARTITIONS]`：`histogram`（字面意为「直方图」）是输出参数，用于存储**每个分区的边界索引**（最终会被 `radix_partition_with_contiguous_buffers_prefetched` 填充，如 `histogram[i]` 表示前 `i+1` 个分区的总元素数，即第 `i` 个分区的结束下标）。
+
+
+#### 4. 打印测试信息（日志输出）
+```cpp
+    cout << "Starting Single Threaded Radix Partition with " << buffered_tuples << " buffered tuples per partition (contiguous, perfetched) and size of Tuple as " << sizeof(Tuple) << " bytes."<<endl;  // 6. 打印测试配置
+```
+- **逐行解释**：
+  - 输出当前测试的关键配置：
+    - 单线程基数分区（`Single Threaded Radix Partition`）。
+    - 每个分区的缓存大小（`buffered_tuples` 个 `Tuple`）。
+    - 优化类型（`contiguous` 连续缓存 + `prefetched` 预取）。
+    - `Tuple` 结构体的字节大小（帮助分析内存占用，如 `Tuple` 含两个 `UInt` 字段时，`sizeof(Tuple)` 为 8 字节）。
+
+
+#### 5. 记录分区开始时间（计时起点）
+```cpp
+    gettimeofday(&start_time, NULL);  // 7. 记录分区开始时间
+```
+- **逐行解释**：
+  - `gettimeofday`：POSIX 函数，获取当前系统时间，参数含义：
+    - `&start_time`：结构体 `timeval`（含 `tv_sec` 秒数和 `tv_usec` 微秒数），存储开始时间。
+    - `NULL`：时区参数（无需指定，传 NULL）。
+  - 作用：后续通过计算 `start_time` 与 `end_time` 的差值，得到分区函数的执行耗时。
+
+
+#### 6. 调用核心分区函数（带预取的连续缓存分区）
+```cpp
+    radix_partition_with_contiguous_buffers_prefetched(input, output, histogram, buffered_tuples);  // 8. 执行带预取的连续缓存基数分区
+```
+- **逐行解释**：
+  - 这是测试的**核心步骤**，函数参数含义：
+    - `input`：输入数组（已在 `main` 函数外层初始化的随机 `Tuple` 数组，`value` 字段为随机分区键）。
+    - `output`：输出数组（存储分区后的结果，内存已通过 `posix_memalign` 分配）。
+    - `histogram`：输出参数（用于接收每个分区的边界索引，供后续校验使用）。
+    - `buffered_tuples`：每个分区的临时缓存大小（从命令行参数解析而来）。
+  - 函数核心优化点（`prefetched` 预取）：
+    - 在写入缓存时，通过 `__builtin_prefetch(buffers + offset + buffer_counters[bucket_num], 1, 0)` 提前将下一个要写入的缓存地址加载到 CPU 缓存，减少「缓存缺失等待时间」，提升写入效率。
+    - 其他逻辑与基础版 `radix_partition_with_contiguous_buffers` 一致：先统计分区元素数→计算分区边界→元素写入缓存→缓存满时批量刷入输出→处理剩余元素。
+
+
+#### 7. 记录分区结束时间（计时终点）
+```cpp
+    gettimeofday(&end_time, NULL);  // 9. 记录分区结束时间
+```
+- **逐行解释**：
+  - 与步骤 7 对应，将当前时间存入 `end_time`，用于计算分区函数的总耗时。
+
+
+#### 8. 计算并输出分区耗时
+```cpp
+    cout << time_difference(start_time, end_time) << endl;  // 10. 输出分区耗时（秒）
+```
+- **逐行解释**：
+  - 调用 `time_difference` 函数（在 `main` 函数前定义），计算 `end_time` 与 `start_time` 的差值：
+    - 函数内部逻辑：`(second.tv_sec - first.tv_sec)*1000000 + (second.tv_usec - first.tv_usec)` → 总微秒数，再除以 1e6 转为秒数。
+  - 输出耗时（如 `0.023` 表示 23 毫秒），用于性能对比（如与无预取的 `CONTIGUOUS_BUFFERS` 版本比较预取带来的加速效果）。
+
+
+#### 9. 校验分区结果正确性
+```cpp
+    check_partioned_output(output, histogram);  // 11. 校验分区结果是否正确
+```
+- **逐行解释**：
+  - 这是确保分区逻辑正确的关键步骤，`check_partioned_output` 函数的核心逻辑（仅在 `DEBUG_CHECK` 宏启用时执行）：
+    1. 遍历每个分区：根据 `histogram` 确定分区的「起始下标」（第 `i` 个分区的起始为 `histogram[i-1]`，第 0 个分区起始为 0）和「结束下标」（`histogram[i]`）。
+    2. 校验分区内元素：对分区内每个元素的 `value` 字段，通过 `GET_BUCKET(value, shift)` 重新计算其应属分区，若与当前分区 `i` 不一致，则输出「INCORRECT」并返回；若一致，累加校验和（`checksum`）用于辅助验证。
+    3. 输出校验结果：若所有元素均正确，打印「Correct !」和校验和（确保每次分区结果一致，排除随机错误）。
+
+
+#### 10. 输出空行（日志格式化）
+```cpp
+    cout << endl;  // 12. 输出空行，分隔不同测试轮次的日志
+```
+- **逐行解释**：
+  - 纯粹的日志格式化操作，使多轮测试或多算法测试的输出结果更易读。
+
+
+#### 11. 释放输出数组内存（避免内存泄漏）
+```cpp
+    free(output);  // 13. 释放输出数组的内存
+}
+#endif  // 结束 CONTIGUOUS_BUFFERS_PREFETCHED 代码块
+```
+- **逐行解释**：
+  - `free(output)`：释放通过 `posix_memalign` 分配的内存（`posix_memalign` 分配的内存需用 `free` 释放，与 `malloc` 兼容）。
+  - 若不释放，会导致每轮测试都泄漏 `ELEMS * sizeof(Tuple)` 大小的内存，长期运行可能导致内存耗尽。
+  - `#endif`：闭合 `#ifdef CONTIGUOUS_BUFFERS_PREFETCHED` 宏，标志该测试块结束。
+
+
+### 四、关联的外层逻辑（main函数中与该代码块相关的前置步骤）
+`CONTIGUOUS_BUFFERS_PREFETCHED` 代码块的执行，依赖 `main` 函数外层的两个关键前置操作：
+
+#### 1. 输入数组（input）的初始化
+```cpp
+// main函数开头：分配输入数组内存
+Tuple *input;
+(void)posix_memalign((void**)&input, 64, ELEMS * sizeof(Tuple));  // 分配64字节对齐的输入内存
+
+// 每轮测试（for (int i = 0; i < TOTAL_RUNS; i++)）中初始化输入数据
+mt19937 gen(19508);  // 随机数生成器（种子19508，确保每次运行数据一致）
+uniform_int_distribution<UInt> dis_elem(0, numeric_limits<UInt>::max());  // 生成[0, UInt最大值]的随机数
+for (size_t i = 0; i < ELEMS; ++i) {
+    UInt elem = dis_elem(gen);  // 生成随机数
+    input[i].rowId = elem;      // 初始化Tuple的rowId（无实际分区意义）
+    input[i].value = elem;      // 初始化Tuple的value（作为分区键，核心）
+}
+```
+- 作用：为每轮测试生成**固定种子的随机输入**（确保多轮测试的输入数据一致，避免数据随机性影响性能对比），`value` 字段是基数分区的「分区键」。
+
+
+#### 2. 多轮测试循环（TOTAL_RUNS）
+```cpp
+cout << "Performing " << TOTAL_RUNS << " runs" << endl << endl;
+for (int i = 0; i < TOTAL_RUNS; i++) {  // 循环执行TOTAL_RUNS次测试
+    cout << "============================ Performing run " << i + 1 << " with " << ELEMS << " elements. ============================" << endl;
+    // ... （中间包含各宏控制的测试块，如CONTIGUOUS_BUFFERS_PREFETCHED）
+}
+```
+- 作用：通过多轮测试（如 `TOTAL_RUNS=5`）减少「系统抖动」（如 CPU 调度、内存页缺失）对性能测试结果的影响，后续可计算多轮耗时的平均值作为最终性能指标。
+
+
+### 五、核心逻辑总结（CONTIGUOUS_BUFFERS_PREFETCHED场景）
+当 `CONTIGUOUS_BUFFERS_PREFETCHED` 启用时，测试程序的完整流程可概括为：
+1. **参数校验**：确保用户传入「每个分区的缓存大小」。
+2. **内存分配**：为输出数组分配 64 字节对齐的内存，提升缓存效率。
+3. **计时启动**：记录分区开始时间。
+4. **核心分区**：调用带预取的连续缓存基数分区函数，通过预取优化减少缓存缺失。
+5. **计时结束**：记录分区结束时间，计算并输出耗时。
+6. **结果校验**：确保每个元素都被分配到正确的分区，避免逻辑错误。
+7. **内存释放**：释放输出数组内存，避免泄漏。
+
+该场景的核心目标是**测试「连续缓存+预取」优化对基数分区性能的提升效果**，通过与无预取的 `CONTIGUOUS_BUFFERS` 版本对比耗时，验证预取策略的有效性。
+*********************************************************
+`radix_partition_with_contiguous_buffers_prefetched` 函数是「带预取优化的连续缓存基数分区」实现，在基础连续缓存分区的逻辑上增加了数据预取（prefetching）机制，进一步提升 CPU 缓存利用率和数据访问效率。以下是其实现逻辑的详细解释：
+
+
+### 函数核心目标
+基数分区（Radix Partitioning）的核心是根据数据的「基数键」（通常是数值的某几位）将输入数据分配到不同的分区（Bucket）中。该函数通过以下优化提升性能：
+1. **连续缓存**：为每个分区分配临时缓存，元素先写入缓存，满后批量刷入输出数组，减少对输出数组的随机写入。
+2. **数据预取**：在写入缓存时，提前将下一个要访问的数据加载到 CPU 缓存，减少「缓存缺失等待时间」。
+
+
+### 函数参数说明
+```cpp
+void radix_partition_with_contiguous_buffers_prefetched(
+    Tuple *input,         // 输入数组：待分区的Tuple元素集合
+    Tuple *output,        // 输出数组：分区后的结果
+    Index *histogram,     // 输出参数：记录每个分区的边界索引（用于校验）
+    const UInt buffered_tuples  // 每个分区的缓存容量（满后批量写入输出）
+)
+```
+
+
+### 实现逻辑逐行解析
+
+#### 1. 常量与变量定义
+```cpp
+constexpr UInt shift = shift_distance();  // 1. 计算基数分区的位移量
+__attribute__((aligned(64))) Index *final_buckets;  // 2. 记录每个分区的元素数量及边界
+__attribute__((aligned(64))) Tuple *buffers;  // 3. 连续缓存区：每个分区占buffered_tuples个位置
+__attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];  // 4. 每个分区的缓存计数器
+```
+- **`shift`**：由宏 `shift_distance()` 计算（如基于 32 位数值的高 k 位分区，`shift = 32 - k`），用于提取分区键的有效位。
+- **内存对齐**：`__attribute__((aligned(64)))` 确保变量按 64 字节（CPU 缓存行大小）对齐，避免「缓存行分裂」，提升访问效率。
+- **`final_buckets`**：动态数组，用于统计每个分区的元素数量，并计算分区在输出数组中的边界。
+- **`buffers`**：连续内存块，划分为 `N_PARTITIONS` 个缓存区（每个大小为 `buffered_tuples * sizeof(Tuple)`），临时存储各分区的元素。
+- **`buffer_counters`**：数组，记录每个分区的缓存当前已存储的元素数量（用于判断缓存是否已满）。
+
+
+#### 2. 内存分配与初始化
+```cpp
+// 5. 分配final_buckets内存（64字节对齐）并初始化为0
+(void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
+
+// 6. 分配连续缓存区buffers（64字节对齐）
+(void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+
+// 7. 初始化缓存计数器（所有分区的缓存计数初始化为0）
+memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
+```
+- **`posix_memalign`**：分配指定对齐的内存（此处为 64 字节），比普通 `malloc` 更适合高性能场景。
+- **`memset`**：将计数器和分区统计数组初始化为 0，避免未定义行为。
+
+
+#### 3. 阶段1：统计每个分区的元素数量（桶计数）
+```cpp
+for(Index j = 0; j < ELEMS; ++j){  // 遍历所有输入元素
+    ++final_buckets[GET_BUCKET(input[j].value, shift)];  // 8. 统计每个分区的元素数
+}
+```
+- **`GET_BUCKET`**：宏定义（如 `(value >> shift) & MASK`），通过位移和掩码提取 `value` 的特定位，确定元素所属的分区编号（0 到 `N_PARTITIONS-1`）。
+- 作用：`final_buckets[i]` 最终存储第 `i` 个分区的元素总数量。
+
+
+#### 4. 阶段2：计算分区边界（前缀和）
+```cpp
+for(Index i = 1; i < N_PARTITIONS; ++i){  // 9. 计算前缀和，确定分区在output中的结束位置
+    final_buckets[i] += final_buckets[i - 1];
+}
+```
+- 例如：若分区 0 有 100 个元素，分区 1 有 200 个元素，则 `final_buckets[0] = 100`，`final_buckets[1] = 300`（表示分区 0 结束于下标 100，分区 1 结束于下标 300）。
+- 作用：将「每个分区的元素数量」转换为「输出数组中的边界索引」，为后续写入输出做准备。
+
+
+#### 5. 保存分区边界到histogram
+```cpp
+memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));  // 10. 复制边界到histogram供外部校验
+```
+- `histogram` 用于记录最终的分区边界，供 `check_partioned_output` 函数验证分区结果的正确性。
+
+
+#### 6. 阶段3：带预取的缓存写入（核心优化）
+```cpp
+__attribute__((aligned(64))) Index bucket_num = 0;  // 当前元素所属的分区编号
+for(Index j = 0; j < ELEMS; ++j){  // 遍历所有输入元素
+    bucket_num = GET_BUCKET(input[j].value, shift);  // 11. 计算当前元素的分区编号
+    Index offset = bucket_num * buffered_tuples;  // 12. 计算该分区在缓存中的起始偏移量
+    
+    // 13. 将元素写入缓存，并递增计数器
+    buffers[offset + buffer_counters[bucket_num]] = input[j];
+    buffer_counters[bucket_num]++;
+    
+    // 14. 预取：提前加载下一个要写入缓存的位置到CPU缓存
+    __builtin_prefetch(buffers + offset + buffer_counters[bucket_num], 1, 0);
+    
+    // 15. 若缓存已满，批量刷入output
+    if (buffer_counters[bucket_num] == buffered_tuples) {
+        final_buckets[bucket_num] -= buffered_tuples;  // 计算output中的写入起始位置
+        
+        // 16. 批量复制缓存数据到output（连续写入，高效）
+        memcpy(output + final_buckets[bucket_num], buffers + offset, sizeof(Tuple) * buffered_tuples);
+        
+        buffer_counters[bucket_num] = 0;  // 17. 重置缓存计数器
+    }
+}
+```
+- **步骤11-13**：计算元素所属分区，确定其在缓存中的位置并写入，同时递增该分区的缓存计数器。
+- **步骤14（预取核心）**：`__builtin_prefetch` 是 GCC 内置函数，提前将「下一个要写入的缓存地址」加载到 CPU 缓存：
+  - 参数 `buffers + offset + buffer_counters[bucket_num]`：下一个写入位置的地址。
+  - 参数 `1`：表示该地址将被写入（预取为「写分配」模式）。
+  - 参数 `0`：预取到 L1 缓存（最高优先级）。
+  - 作用：当 CPU 实际写入下一个元素时，数据已在缓存中，避免「缓存缺失」导致的等待（通常耗时数十到数百个 CPU 周期）。
+- **步骤15-17**：当缓存计数器达到 `buffered_tuples`（缓存满）时：
+  - 计算输出数组中该分区的写入起始位置（`final_buckets[bucket_num] - buffered_tuples`）。
+  - 通过 `memcpy` 批量复制缓存数据到输出数组（连续内存块复制，利用 CPU 高效指令）。
+  - 重置计数器，准备接收新元素。
+
+
+#### 7. 处理缓存中剩余的未刷入数据
+```cpp
+for (Index i = 0; i < N_PARTITIONS; i++) {  // 遍历所有分区
+    Index offset = i * buffered_tuples;  // 18. 该分区在缓存中的偏移量
+    
+    // 19. 将剩余元素逐个写入output的对应位置
+    for (UInt b = 0; b < buffer_counters[i]; b++) {
+        output[final_buckets[i] - 1] = buffers[offset + b];
+        --final_buckets[i];  // 递减分区的当前写入位置
+    }
+}
+```
+- 缓存可能未填满（如最后一批元素不足 `buffered_tuples` 个），需遍历所有分区，将缓存中剩余的元素写入输出数组。
+- 写入位置从分区的「结束边界」向前递减（与批量写入的方向一致，确保分区内元素连续）。
+
+
+#### 8. 释放动态分配的内存
+```cpp
+free(final_buckets);  // 20. 释放分区边界数组
+free(buffers);        // 21. 释放连续缓存区
+```
+- 避免内存泄漏，释放 `posix_memalign` 分配的动态内存。
+
+
+### 核心优化点总结
+1. **连续缓存减少随机写入**：元素先写入分区专属缓存，满后批量刷入输出数组，将「零散的随机写入」转化为「连续的批量写入」，利用 CPU 缓存的空间局部性。
+2. **数据预取隐藏延迟**：通过 `__builtin_prefetch` 提前加载下一个写入位置的数据到缓存，减少 CPU 等待内存的时间，尤其在大数据量场景下效果显著。
+3. **内存对齐提升效率**：所有关键数据结构按 64 字节（缓存行大小）对齐，避免跨缓存行访问的额外开销。
+
+
+### 与基础版本的差异
+`radix_partition_with_contiguous_buffers_prefetched` 与基础版 `radix_partition_with_contiguous_buffers` 的唯一区别是**增加了预取指令**（步骤14）。这一微小改动针对 CPU 缓存机制进行优化，在高并发或大数据量场景下，可显著降低缓存缺失率，提升分区性能（通常可带来 10%-30% 的速度提升，具体取决于数据规模和硬件环境）。
+**************************************************************
+RW_BUFFERS_256STREAM 模式基数分区
+好的，我们来逐行详细解释您提供的 C++ 程序。这个程序是一个用于基数分区的基准测试工具，包含了许多性能优化的技巧。
+
+为了方便理解，我将程序分为几个主要部分进行解释。
+
+-----
+
+### **1. 基础类型与宏定义**
+
+这一部分定义了程序中使用的基本数据类型和常量，用于配置和控制测试。
+
+```cpp
+#include <limits>       // 用于 numeric_limits
+#include <stdlib.h>     // 用于 posix_memalign, exit
+#include <iostream>     // 用于标准输入输出流
+#include <random>       // 用于随机数生成
+#include <sys/time.h>   // 用于 gettimeofday 精确计时
+#include <assert.h>     // 用于断言 assert()
+#include <sys/mman.h>   // 用于 mmap 分配大页内存
+#include <string.h>     // 用于 memset, memcpy
+#include <math.h>       // 用于数学函数（虽然这里没直接用）
+#include "emmintrin.h"  // SSE2 指令集头文件
+#include "immintrin.h"  // AVX, AVX2 等指令集头文件
+#include "smmintrin.h"  // SSE4.1 指令集头文件
+```
+
+  * 这部分包含了程序所需的各种标准库和特定于 CPU 指令集的头文件。`immintrin.h` 是最关键的，它包含了 AVX 和 AVX2 等高级指令。
+
+<!-- end list -->
+
+```cpp
+#define N_PARTITIONS 16 // 分区数（必须是2的幂，如8、16、32）
+#define ELEMS 1024 * 1024 * 10 // 总元素数（1000万，可调整）
+#define TOTAL_RUNS 3    // 测试轮次（多次运行取稳定值）
+#define DEBUG_CHECK 1   // 1=启用分区结果校验，0=禁用
+#define WIDTH_32 1      // 1=32位UInt，0=64位UInt
+```
+
+  * `N_PARTITIONS`：定义了数据将要被分割成的分区数量。设置为 16，这是一个 2 的幂次，这对于使用位运算来确定分区编号非常高效。
+  * `ELEMS`：定义了要处理的元素总数，这里是 1000 万。
+  * `TOTAL_RUNS`：定义了基准测试运行的次数，以获得更稳定的平均性能数据。
+  * `DEBUG_CHECK`：一个开关，用于控制是否在每次分区后进行结果校验。
+  * `WIDTH_32`：决定使用 32 位还是 64 位无符号整数作为 `UInt` 类型，这会影响 `Tuple` 的大小和 AVX 指令一次能处理的元素数量。
+
+<!-- end list -->
+
+```cpp
+constexpr UInt log2partitions() {
+    return N_PARTITIONS == 2 ? 1 : 
+           N_PARTITIONS == 4 ? 2 : 
+           N_PARTITIONS == 8 ? 3 : 
+           N_PARTITIONS == 16 ? 4 : 
+           N_PARTITIONS == 32 ? 5 : 6;
+}
+```
+
+  * `log2partitions()`：这是一个编译期常量表达式函数，它计算 `N_PARTITIONS` 的以 2 为底的对数。例如，当 `N_PARTITIONS` 为 16 时，返回值为 4。这个值将在分区键的计算中用到。
+
+<!-- end list -->
+
+```cpp
+typedef uint32_t Index;
+#ifdef WIDTH_32
+typedef unsigned int UInt;
+#define TUPLES_PER_CACHELINE 8
+#define STREAM_UNIT 4
+#else
+typedef unsigned long UInt;
+#define TUPLES_PER_CACHELINE 4
+#define STREAM_UNIT 2
+#endif
+
+struct Tuple {
+    UInt value;
+    UInt rowId;
+};
+```
+
+  * `Index`：定义为 32 位无符号整数，用于数组索引和计数。
+  * `UInt`：根据 `WIDTH_32` 的定义，被设置为 `unsigned int`（32位）或 `unsigned long`（64位）。
+  * `TUPLES_PER_CACHELINE`：计算一个 64 字节的缓存行能容纳多少个 `Tuple`。如果 `UInt` 是 32 位，则 `Tuple` 是 8 字节，每行可容纳 8 个。
+  * `STREAM_UNIT`：定义了 256 位 AVX 指令一次能处理的 `Tuple` 数量。如果 `UInt` 是 32 位，`Tuple` 8 字节，`256位 = 32字节`，则一次可处理 4 个。
+  * `Tuple`：核心数据结构，包含一个键值 `value` 和一个行 ID `rowId`。
+
+<!-- end list -->
+
+```cpp
+constexpr UInt shift_distance() {
+#ifdef WIDTH_32
+    return (32 - log2partitions());
+#else
+    return (64 - log2partitions());
+#endif
+}
+
+#define GET_BUCKET(value, shift) (((value) >> (shift)) & (N_PARTITIONS - 1))
+```
+
+  * `shift_distance()`：计算基数分区所需的位移量。它从 `value` 的最高位开始提取 `log2partitions()` 位作为分区键。
+  * `GET_BUCKET`：一个宏，用于计算给定 `value` 应该属于哪个分区。它将 `value` 向右位移，然后使用一个掩码 `(N_PARTITIONS - 1)` 来获取分区编号。这个掩码操作非常高效，因为 `N_PARTITIONS` 是 2 的幂。
+
+-----
+
+### **2. 工具函数**
+
+这部分包含了一些辅助功能，用于计时、内存分配和结果验证。
+
+```cpp
+double time_difference(struct timeval& first, struct timeval& second) {
+    // ...
+}
+```
+
+  * `time_difference`：一个简单的函数，计算两个 `timeval` 结构体之间的时间差，返回以秒为单位的浮点数。
+
+<!-- end list -->
+
+```cpp
+void* malloc_huge(size_t size) {
+    // ...
+}
+```
+
+  * `malloc_huge`：用于分配大页内存。它调用 `mmap` 系统调用，并使用 `MAP_HUGETLB` 标志来请求操作系统分配大页，以减少 TLB 未命中。如果分配失败，会打印错误并退出。
+
+<!-- end list -->
+
+```cpp
+void check_partioned_output_padded(Tuple* output, Index* histogram, Index* unpaddedBucketSizes) {
+    // ...
+}
+```
+
+  * `check_partioned_output_padded`：这个函数专门用于验证 **`RW_BUFFERS_256STREAM`** 算法的输出。它会遍历每个分区，但只检查**有效数据范围**（即不包括填充），并验证每个元素是否属于正确的桶，同时计算校验和以确保数据完整性。
+
+-----
+
+### **3. 核心分区函数 `radix_partition_with_rw_buffers_streamed_256_write`**
+
+这是整个程序的**核心**，实现了高效的基数分区算法。
+
+```cpp
+// 1. 计算位移量
+constexpr UInt shift = shift_distance();
+
+// 2. 分配对齐内存
+__attribute__((aligned(64))) Index* final_buckets;
+__attribute__((aligned(64))) Tuple* buffers;
+__attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS];
+```
+
+  * 首先，计算位移量。然后，为三个关键数组分配并对齐内存：
+      * `final_buckets`：用于存储每个分区最终的大小（包含填充）。
+      * `buffers`：一个巨大的连续缓存区，为每个分区提供一个子缓存。
+      * `buffer_counters`：一个计数器数组，记录每个分区缓存当前已存入的元素数量。
+
+<!-- end list -->
+
+```cpp
+// 3. 阶段1：统计每个分区的原始元素数量
+for (Index j = 0; j < ELEMS; ++j) {
+    UInt bucket = GET_BUCKET(input[j].value, shift);
+    ++final_buckets[bucket];
+}
+memcpy(unpaddedBucketSizes, final_buckets, N_PARTITIONS * sizeof(Index));
+```
+
+  * **直方图构建**。这是第一个阶段，遍历输入数组，统计每个分区中实际的元素数量，并将结果存储在 `final_buckets` 中。
+
+<!-- end list -->
+
+```cpp
+// 4. 阶段2：为分区添加填充
+size_t rest;
+for (Index i = 0; i < N_PARTITIONS; ++i) {
+    if ((rest = (final_buckets[i] % STREAM_UNIT)) != 0) {
+        final_buckets[i] += STREAM_UNIT - rest;
+    }
+}
+```
+
+  * **填充阶段**。遍历每个分区的大小，如果不是 `STREAM_UNIT` 的倍数，就向上取整，使其成为倍数。这保证了在流式写入时，每个分区都可以被完整地、高效地用 AVX 指令处理。
+
+<!-- end list -->
+
+```cpp
+// 5. 阶段3：计算分区边界
+for (Index i = 1; i < N_PARTITIONS; ++i) {
+    final_buckets[i] += final_buckets[i - 1];
+}
+memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
+```
+
+  * **前缀和计算**。将 `final_buckets` 数组转换为前缀和，使得 `final_buckets[i]` 存储的是**第 0 到第 i 个分区所有元素（含填充）的总数**。这能帮助我们快速确定每个分区在输出数组中的最终结束位置。
+
+<!-- end list -->
+
+```cpp
+// 6. 分配输出内存
+(void)posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
+```
+
+  * 根据前缀和计算出的总大小，为最终的输出数组分配内存。
+
+<!-- end list -->
+
+```cpp
+// 7. 阶段4：带AVX流写入的缓存分区
+for (Index j = 0; j < ELEMS; ++j) {
+    // 7.1 确定当前元素的分区编号
+    bucket_num = GET_BUCKET(input[j].value, shift);
+    Index buffer_offset = bucket_num * buffered_tuples;
+    // 7.2 将元素写入分区缓存
+    buffers[buffer_offset + buffer_counters[bucket_num]++] = input[j];
+
+    // 7.3 若缓存已满，使用AVX流指令批量写入输出
+    if (buffer_counters[bucket_num] == buffered_tuples) {
+        final_buckets[bucket_num] -= buffered_tuples; // 从后向前写，更新写入位置
+        for (UInt b = 0; b < buffered_tuples; b += STREAM_UNIT) {
+            __m256i data = _mm256_load_si256(reinterpret_cast<__m256i*>(buffers + buffer_offset + b));
+            _mm256_stream_si256(reinterpret_cast<__m256i*>(output + final_buckets[bucket_num] + b), data);
+        }
+        buffer_counters[bucket_num] = 0;
+    }
+}
+```
+
+  * **数据分区和流式写入**。这是算法最核心、性能最优的部分。
+  * 它再次遍历输入数组，将每个元组放入其对应的缓存区中。
+  * 当一个缓存区满了（`buffer_counters[bucket_num] == buffered_tuples`），它就会将这个缓存区的数据整块地使用 `_mm256_stream_si256` 指令写入输出数组。
+  * `_mm256_load_si256` 从缓存中加载 256 位数据。
+  * `_mm256_stream_si256` 执行非临时性写入，将数据直接写入主内存，避免污染 CPU 缓存。
+  * `final_buckets[bucket_num] -= buffered_tuples` 的操作表明数据是从每个分区的**末尾**向**前**写入的，这是一种常见的优化技巧，可以简化逻辑并避免额外的数组来追踪写入位置。
+
+<!-- end list -->
+
+```cpp
+// 8. 阶段5：处理缓存中剩余的未填满元素
+for (Index i = 0; i < N_PARTITIONS; i++) {
+    // ...
+}
+```
+
+  * 在主循环结束后，一些缓存可能没有被完全填满。这段代码负责将所有分区中剩余的、不足一个缓存块的数据写入到输出数组。
+
+-----
+
+### **4. 主测试流程**
+
+这部分包含了程序的入口点 `main` 函数，负责设置、运行和报告结果。
+
+```cpp
+int main(int argc, char* argv[]) {
+    // 1. 检查命令行参数
+    if (argc < 2) {
+        // ...
+    }
+    const UInt buffered_tuples = (UInt)atoi(argv[1]);
+    if (buffered_tuples % STREAM_UNIT != 0) {
+        // ...
+    }
+```
+
+  * 程序要求在命令行中提供一个参数，即每个分区的缓存大小 `buffered_tuples`。并且该值必须是 `STREAM_UNIT` 的倍数，以确保流式写入的正确性。
+
+<!-- end list -->
+
+```cpp
+// 2. 初始化随机输入数据
+mt19937 gen(19508);
+uniform_int_distribution<UInt> dis(0, numeric_limits<UInt>::max());
+Tuple* input;
+(void)posix_memalign((void**)&input, 64, ELEMS * sizeof(Tuple));
+// ...填充数据
+```
+
+  * 使用一个固定的种子（19508）来初始化随机数生成器，保证每次运行生成的测试数据都是完全相同的，这对于进行可复现的性能测试至关重要。
+
+<!-- end list -->
+
+```cpp
+// 3. 执行多轮测试
+double total_time = 0.0;
+for (int run = 0; run < TOTAL_RUNS; run++) {
+    // ...
+    // 3.1 初始化输出和统计变量
+    // 3.2 执行分区并计时
+    // 3.3 计算耗时并累加
+    // 3.4 校验分区结果
+    // 3.5 释放当前轮输出内存
+}
+```
+
+  * 程序在一个循环中执行多次测试，每次都重新分配内存并执行分区算法。这有助于减少由于系统状态或其他外部因素造成的性能波动，从而获得更可靠的平均时间。
+
+<!-- end list -->
+
+```cpp
+// 4. 输出平均耗时
+std::cout << "平均分区耗时：" << (total_time / TOTAL_RUNS) << " 秒" << std::endl;
+std::cout << "吞吐量：" << (ELEMS / (total_time / TOTAL_RUNS) / 1000000) << " M Tuple/秒" << std::endl;
+```
+
+  * 最后，计算并输出所有测试轮次的平均耗时和吞吐量，给出最终的性能结果。
