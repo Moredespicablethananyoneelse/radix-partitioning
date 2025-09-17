@@ -1449,3 +1449,380 @@ std::cout << "吞吐量：" << (ELEMS / (total_time / TOTAL_RUNS) / 1000000) << 
 ```
 
   * 最后，计算并输出所有测试轮次的平均耗时和吞吐量，给出最终的性能结果。
+**************************************************************************
+以下是对`radix_partition_with_contiguous_buffers_streamed_256_write_prefetched`函数的逐行解释：
+
+```cpp
+// 条件编译：仅当定义了CONTIGUOUS_BUFFERS_256STREAM_PREFETCHED宏时才编译此函数
+#ifdef CONTIGUOUS_BUFFERS_256STREAM_PREFETCHED
+
+// 函数定义：带连续缓冲区、256位AVX流写入和预取优化的基数分区函数
+// 参数说明：
+// - input：输入元组数组
+// - output：输出元组数组（引用传递，函数内部分配内存）
+// - histogram：分区直方图（存储每个分区的结束位置，含填充）
+// - unpaddedBucketSizes：每个分区的实际元素数量（不含填充）
+// - buffered_tuples：每个分区的缓冲区大小
+void radix_partition_with_contiguous_buffers_streamed_256_write_prefetched(
+    Tuple *input, 
+    Tuple *&output, 
+    Index *histogram, 
+    Index *unpaddedBucketSizes, 
+    const UInt buffered_tuples
+) {
+    // 计算移位距离：32位数值中，从高位开始取log2(N_PARTITIONS)位作为分区标识
+    // log2partitions()是宏定义，返回分区数的对数（如分区数16则返回4）
+    constexpr UInt shift = 32 - log2partitions();
+
+    // 定义64字节对齐的变量（适配CPU缓存行，减少缓存未命中）
+    __attribute__((aligned(64))) Index *final_buckets;    // 存储每个分区的元素计数及最终位置
+    __attribute__((aligned(64))) Tuple *buffers;          // 连续缓冲区（每个分区一个子缓冲区）
+    __attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS]; // 每个缓冲区的当前元素计数
+
+    // 为final_buckets分配64字节对齐的内存（大小为分区数×索引类型大小）
+    (void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+    // 初始化final_buckets为0（计数从0开始）
+    memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
+
+    // 为缓冲区分配64字节对齐的内存（总大小=分区数×每个分区的缓冲区大小×元组大小）
+    (void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+    // 初始化缓冲区计数器为0（所有缓冲区初始为空）
+    memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
+
+    // 第一步：统计每个分区的元素数量（构建频率直方图）
+    for(Index j = 0; j < ELEMS; ++j){
+        // 计算当前元组的分区编号（GET_BUCKET是宏，通过移位和掩码实现）
+        // 递增对应分区的计数
+        ++final_buckets[GET_BUCKET(input[j].value, shift)];
+    }
+
+    // 保存每个分区的实际元素数量（未填充前的大小，用于后续校验）
+    memcpy(unpaddedBucketSizes, final_buckets, N_PARTITIONS * sizeof(Index));
+
+    // 对每个分区的大小进行填充，确保是4的倍数
+    // 原因：4个Tuple正好占32字节（256位），适配AVX2的256位批量操作
+    size_t rest;  // 存储余数
+    for(Index i = 0; i < N_PARTITIONS; ++i){
+        // 计算当前分区大小除以4的余数
+        if((rest = (final_buckets[i] % 4)) != 0) {
+            // 若有余数，补充(4 - 余数)个填充元素
+            final_buckets[i] += 4 - rest;
+        }
+    }
+
+    // 计算每个分区的结束位置（前缀和操作）
+    // 例如：分区0结束于final_buckets[0]，分区1结束于final_buckets[0]+final_buckets[1]，以此类推
+    for(Index i = 1; i < N_PARTITIONS; ++i){
+        final_buckets[i] += final_buckets[i - 1];
+    }
+
+    // 将分区结束位置写入histogram，供外部使用（如验证分区结果）
+    memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
+
+    // 根据histogram分配输出数组内存（64字节对齐，总大小为最后一个分区的结束位置×元组大小）
+    (void)posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
+
+    // 声明64字节对齐的变量，存储当前元组的分区编号
+    __attribute__((aligned(64))) Index bucket_num = 0;
+
+    // 第二步：将输入元组写入缓冲区，并在缓冲区满时批量写入输出
+    for(Index j = 0; j < ELEMS; ++j){
+        // 计算当前元组所属的分区编号
+        bucket_num = GET_BUCKET(input[j].value, shift);
+        // 计算当前分区在缓冲区中的偏移量（分区编号×每个分区的缓冲区大小）
+        Index offset = bucket_num * buffered_tuples;
+        // 将元组写入缓冲区的对应位置，并递增缓冲区计数器
+        buffers[offset + buffer_counters[bucket_num]++] = input[j];
+
+        // 预取优化：提前加载缓冲区中下一个要写入的位置到缓存
+        // 参数说明：
+        // - 第一个参数：要预取的地址（下一个空闲位置）
+        // - 第二个参数：1表示写入预取（告诉CPU这部分内存即将被写入）
+        // - 第三个参数：0表示预取到L1缓存
+        __builtin_prefetch(buffers + offset + buffer_counters[bucket_num], 1, 0);
+
+        // 当缓冲区满时，将缓冲区内容批量写入输出数组
+        if (buffer_counters[bucket_num] == buffered_tuples) {
+            // 预取缓冲区中所有元素到缓存（为即将到来的读取做准备）
+            for(UInt b = 0; b < buffered_tuples; b += 1) {
+                __builtin_prefetch(buffers + offset + b, 1, 0);
+            }
+
+            // 计算当前分区在输出数组中的起始位置（从后往前写，避免覆盖）
+            final_buckets[bucket_num] -= buffered_tuples;
+
+            // 使用AVX2指令批量写入（每次256位，即4个Tuple）
+            for(UInt b = 0; b < buffered_tuples; b += 4) {
+                // 从缓冲区加载256位数据（_mm256_load_si256：对齐加载）
+                __m256i data = _mm256_load_si256(reinterpret_cast<__m256i*>(buffers + offset + b));
+                // 流写入输出数组（_mm256_stream_si256：绕过缓存直接写入内存，减少缓存污染）
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(output + final_buckets[bucket_num]), data);
+                // 更新输出位置（移动4个Tuple）
+                final_buckets[bucket_num] += 4;
+            }
+
+            // 恢复final_buckets的位置（供后续剩余元素写入）
+            final_buckets[bucket_num] -= buffered_tuples;
+            // 重置当前分区的缓冲区计数器
+            buffer_counters[bucket_num] = 0;
+        }
+    }
+
+    // 处理每个分区的剩余元素（缓冲区未满的部分）
+    for (Index i = 0; i < N_PARTITIONS; i++) {
+        // 计算当前分区在缓冲区中的偏移量
+        Index offset = i * buffered_tuples;
+        // 逐个写入剩余元素（从分区结束位置往前写，确保分区内顺序正确）
+        for (UInt b = 0; b < buffer_counters[i]; b++) {
+            output[final_buckets[i] - 1] = buffers[offset + b];
+            --final_buckets[i];
+        }
+    }
+
+    // 释放临时分配的内存
+    free(final_buckets);
+    free(buffers);
+}
+
+// 条件编译结束
+#endif
+```
+
+### 核心优化点总结：
+1. **内存对齐**：所有数组均采用64字节对齐，适配CPU缓存行大小，减少缓存未命中。
+2. **预取优化**：使用`__builtin_prefetch`提前将数据加载到缓存，掩盖内存访问延迟。
+3. **AVX2指令**：通过`_mm256_load_si256`和`_mm256_stream_si256`实现256位批量读写，提升吞吐量。
+4. **缓冲区机制**：先将数据写入缓冲区，满后批量写入输出，减少直接写内存的次数。
+5. **填充优化**：确保分区大小为4的倍数，避免AVX指令访问越界。
+
+该函数通过结合预取、向量指令和缓存优化，显著提升了基数分区的性能，尤其适合处理大规模数据。
+********************************************************
+是的，这个函数中两次使用`__builtin_prefetch`分别针对**写入操作**和**读取操作**进行了预取优化，目的是提前将数据加载到CPU缓存中，减少内存访问延迟。具体区别如下：
+
+
+### 1. 第一次预取：针对缓冲区的写入预取
+```cpp
+__builtin_prefetch(buffers + offset + buffer_counters[bucket_num], 1, 0);
+```
+- **场景**：在将当前元组写入缓冲区后，预取下一个要写入的缓冲区位置。
+- **参数含义**：
+  - 第一个参数：`buffers + offset + buffer_counters[bucket_num]`  
+    指向缓冲区中**下一个空闲位置**（即将被写入的地址）。
+  - 第二个参数：`1`  
+    表示“写入预取”（告诉CPU：这块内存即将被写入，提前加载到缓存可加速后续写入操作）。
+  - 第三个参数：`0`  
+    表示预取到L1缓存（最快的缓存层级，适合立即使用的数据）。
+- **作用**：提前将缓冲区的下一个写入位置加载到缓存，避免后续写入时的缓存未命中（写操作也需要先将内存加载到缓存，修改后再回写）。
+
+
+### 2. 第二次预取：针对缓冲区的读取预取
+```cpp
+for(UInt b = 0; b < buffered_tuples; b += 1) {
+    __builtin_prefetch(buffers + offset + b, 1, 0);
+}
+```
+- **场景**：当缓冲区满时，在批量读取缓冲区内容并写入输出前，预取整个缓冲区的数据。
+- **参数含义**：
+  - 第一个参数：`buffers + offset + b`  
+    指向缓冲区中**即将被读取的元素**（后续会通过`_mm256_load_si256`加载到AVX寄存器）。
+  - 第二个参数：`1`  
+    虽然标记为“写入预取”，但这里实际是为**读取操作**服务：预取缓冲区数据到缓存，加速后续的`_mm256_load_si256`读取（因为读取前数据必须在缓存中）。
+  - 第三个参数：`0`  
+    同样预取到L1缓存，确保最快访问。
+- **作用**：提前将整个缓冲区的内容加载到缓存，避免`_mm256_load_si256`批量读取时的缓存未命中，加速从缓冲区到输出数组的数据拷贝。
+
+
+### 总结
+两次预取的目标不同：
+- 第一次是为了**后续写入缓冲区**做准备，避免写入时的缓存延迟；
+- 第二次是为了**即将到来的缓冲区读取**做准备，加速批量加载数据到AVX寄存器的过程。
+
+通过这种“预取-操作”的配合，CPU可以在执行当前指令时并行加载后续所需数据，掩盖内存访问的长延迟，从而提升整体性能。
+***************************************************************************
+要理解 `radix_partition_with_contiguous_buffers_streamed_256_write_v2` 函数，需先明确其定位：这是**基数排序（Radix Sort）的核心分区函数**，在 v1 版本基础上做了宏定义优化（如用 `TUPLES_PER_CACHELINE`/`STREAM_UNIT` 替代硬编码），保留了“连续缓冲区+256位AVX流写入”的核心优化逻辑，同时提升了代码可维护性。以下逐行拆解其功能、参数含义及优化细节：
+
+
+```cpp
+// 条件编译开关：仅当定义了 CONTIGUOUS_BUFFERS_256STREAM_V2 宏时，才编译该函数
+// 作用：支持多版本算法共存（如v1/v2可分别测试性能），避免代码冲突
+#ifdef CONTIGUOUS_BUFFERS_256STREAM_V2
+
+// 函数定义：带连续缓冲区、256位AVX流写入的基数分区函数（v2版本）
+// 参数详解：
+// - input：输入元组数组（待分区的数据，每个Tuple含需排序的value字段）
+// - output：输出元组数组（引用传递，函数内部分配内存，分区后的数据存在这里）
+// - histogram：分区直方图（输出参数，存储每个分区的“结束位置”，含填充）
+// - unpaddedBucketSizes：未填充的分区大小（输出参数，存储每个分区的实际元素数，不含填充）
+// - buffered_tuples：单个分区的缓冲区容量（每次缓冲区满后批量写入输出）
+void radix_partition_with_contiguous_buffers_streamed_256_write_v2(
+    Tuple *input, 
+    Tuple *&output, 
+    Index *histogram, 
+    Index *unpaddedBucketSizes, 
+    const UInt buffered_tuples
+) {
+    // 1. 计算基数排序的“移位距离”
+    // shift_distance() 是宏/内联函数：根据当前排序的“位段”（如高8位/低16位）返回移位值
+    // 核心逻辑：通过移位将待排序的“目标位段”移到最低位，便于后续提取分区编号
+    // 例：若排序32位整数的高8位（第24-31位），shift_distance() 会返回 24
+    constexpr UInt shift = shift_distance();
+
+    // 2. 定义64字节对齐的变量（关键优化：适配CPU缓存行）
+    // CPU缓存行通常为64字节，对齐后可避免“缓存行分裂”（一个数据跨2个缓存行，需2次读取）
+    __attribute__((aligned(64))) Index *final_buckets;    // 存储分区的“计数→结束位置”（核心辅助数组）
+    __attribute__((aligned(64))) Tuple *buffers;          // 连续缓冲区（每个分区对应一个子缓冲区）
+    __attribute__((aligned(64))) UInt buffer_counters[N_PARTITIONS]; // 每个缓冲区的当前元素计数（初始为0）
+
+    // 3. 为 final_buckets 分配64字节对齐内存
+    // posix_memalign：比 malloc 更严格的内存分配，确保起始地址是64的整数倍
+    // 参数：(输出地址指针, 对齐字节数, 内存大小)
+    // (void) 强制忽略返回值（实际工程中需判断是否分配成功，此处为简化）
+    (void)posix_memalign((void**)&final_buckets, 64, N_PARTITIONS * sizeof(Index));
+    // 初始化 final_buckets 为0：所有分区的初始计数从0开始
+    memset(final_buckets, 0, N_PARTITIONS * sizeof(Index));
+
+    // 4. 为连续缓冲区分配内存
+    // 总大小 = 分区数 × 单个分区缓冲区容量 × 单个元组大小
+    // 例：若N_PARTITIONS=16，buffered_tuples=256，Tuple=8字节，则总大小=16×256×8=32768字节
+    (void)posix_memalign((void**)&buffers, 64, N_PARTITIONS * buffered_tuples * sizeof(Tuple));
+    // 初始化缓冲区计数器：所有分区的缓冲区初始为空（计数0）
+    memset(buffer_counters, 0, N_PARTITIONS * sizeof(UInt));
+
+    // 5. 第一步：统计每个分区的实际元素数量（构建“频率直方图”）
+    // 遍历所有输入元组，对每个元组按“目标位段”分配分区，并递增对应分区的计数
+    for(Index j = 0; j < ELEMS; ++j){
+        // GET_BUCKET 是宏：通过“移位+掩码”提取 input[j].value 的目标位段，得到分区编号
+        // 例：若shift=24（取高8位），则 GET_BUCKET(val,24) = (val >> 24) & 0xFF（0xFF是8位掩码）
+        // 核心：将输入数据按位段“分组”到不同分区
+        ++final_buckets[GET_BUCKET(input[j].value, shift)];
+    }
+
+    // 6. 保存未填充的分区大小（供外部使用，如后续处理真实数据量）
+    // 此时 final_buckets 存储的是每个分区的“实际元素数”（无填充），直接拷贝到 unpaddedBucketSizes
+    memcpy(unpaddedBucketSizes, final_buckets, N_PARTITIONS * sizeof(Index));
+
+    // 7. 对分区大小进行“填充”：确保每个分区的元素数是 TUPLES_PER_CACHELINE 的倍数
+    // 注释说明：4个Tuple占32字节（=256位），适配AVX2的256位批量指令（避免指令越界）
+    // TUPLES_PER_CACHELINE 是宏：此处等于4（因256位=32字节，每个Tuple=8字节 → 32/8=4）
+    size_t rest;  // 存储分区大小除以 TUPLES_PER_CACHELINE 的余数
+    for(Index i = 0; i < N_PARTITIONS; ++i){
+        // 计算当前分区大小的余数
+        if((rest = (final_buckets[i] % TUPLES_PER_CACHELINE)) != 0) {
+            // 若有余数，补充 (TUPLES_PER_CACHELINE - rest) 个“填充元素”
+            // 例：分区大小=5，TUPLES_PER_CACHELINE=4 → 余数1 → 填充3个，总大小=8
+            final_buckets[i] += TUPLES_PER_CACHELINE - rest;
+        }
+    }
+
+    // 8. 计算每个分区的“结束位置”（前缀和操作）
+    // 核心：将“频率计数”转换为“输出数组中的结束索引”，用于后续定位写入位置
+    // 例：初始final_buckets=[4,4,4]（3个分区，每个填充后4个元素）
+    // 执行后：i=1 → final_buckets[1] = 4+4=8；i=2 → final_buckets[2] =8+4=12
+    // 结果：分区0结束于4，分区1结束于8，分区2结束于12（输出数组总大小12）
+    for(Index i = 1; i < N_PARTITIONS; ++i){
+        final_buckets[i] += final_buckets[i - 1];
+    }
+
+    // 9. 将分区结束位置写入 histogram（供外部验证或后续排序步骤使用）
+    memcpy(histogram, final_buckets, N_PARTITIONS * sizeof(Index));
+
+    // 10. 为输出数组分配内存
+    // 大小 = 最后一个分区的结束位置 × 单个元组大小（即输出数组总容量）
+    // 同样要求64字节对齐，避免缓存行分裂
+    (void)posix_memalign((void**)&output, 64, final_buckets[N_PARTITIONS - 1] * sizeof(Tuple));
+
+    // 11. 声明分区编号变量（64字节对齐，减少缓存访问延迟）
+    __attribute__((aligned(64))) Index bucket_num = 0;
+
+    // 12. 第二步：将输入元组写入缓冲区，满后批量写入输出（核心数据搬运逻辑）
+    for(Index j = 0; j < ELEMS; ++j){
+        // 步骤1：确定当前元组的分区编号
+        bucket_num = GET_BUCKET(input[j].value, shift);
+        // 步骤2：计算当前分区在缓冲区中的“基地址偏移”
+        // 每个分区的缓冲区是连续的：分区0→[0, buffered_tuples)，分区1→[buffered_tuples, 2*buffered_tuples)
+        Index offset = bucket_num * buffered_tuples;
+        // 步骤3：将元组写入缓冲区，并递增该分区的计数器
+        // buffer_counters[bucket_num] 是当前分区的已写入元素数，++后置表示先写再计数
+        buffers[offset + buffer_counters[bucket_num]++] = input[j];
+
+        // 步骤4：若缓冲区已满（达到 buffered_tuples 容量），批量写入输出
+        if (buffer_counters[bucket_num] == buffered_tuples) {
+            // 计算当前分区在输出数组中的“起始写入位置”（从后往前写，避免覆盖）
+            // 例：分区0结束位置是4，buffered_tuples=4 → 起始位置=4-4=0
+            final_buckets[bucket_num] -= buffered_tuples;
+
+            // 批量写入：用AVX2指令每次写入 STREAM_UNIT 个元组（256位）
+            // STREAM_UNIT 是宏：等于4（同 TUPLES_PER_CACHELINE，适配256位指令）
+            for(UInt b = 0; b < buffered_tuples; b += STREAM_UNIT) {
+                // ① 从缓冲区加载256位数据（_mm256_load_si256：AVX2对齐加载指令）
+                // reinterpret_cast：将 Tuple* 强制转为 __m256i*（AVX2寄存器类型）
+                // 一次加载4个Tuple（4×8字节=32字节=256位）
+                __m256i data = _mm256_load_si256(reinterpret_cast<__m256i*>(buffers + offset + b));
+                
+                // ② 流写入输出数组（_mm256_stream_si256：AVX2非临时写入指令）
+                // 核心优化：绕过CPU缓存直接写入内存，避免“缓存污染”（输出数据后续可能不再使用）
+                // 若用普通赋值（output[...] = ...），会先加载到缓存，浪费缓存空间
+                _mm256_stream_si256(
+                    reinterpret_cast<__m256i*>(output + final_buckets[bucket_num]), 
+                    data
+                );
+                
+                // ③ 更新输出位置：每次写入4个元组，位置后移4
+                final_buckets[bucket_num] += STREAM_UNIT;
+            }
+
+            // 恢复 final_buckets 的“结束位置”（供后续剩余元素写入）
+            // 例：写入前起始位置0，写入4个元素后位置4 → 恢复为4-4=0（下次写入从0开始）
+            final_buckets[bucket_num] -= buffered_tuples;
+            // 重置缓冲区计数器：当前分区的缓冲区清空，准备下次写入
+            buffer_counters[bucket_num] = 0;
+        }
+    }
+
+    // 13. 第三步：处理缓冲区中未装满的“剩余元素”
+    // 上述循环中，若分区元素数不是 buffered_tuples 的整数倍，会有剩余元素留在缓冲区
+    for (Index i = 0; i < N_PARTITIONS; i++) {
+        // 计算当前分区在缓冲区中的基地址偏移
+        Index offset = i * buffered_tuples;
+        // 逐个写入剩余元素（数量=buffer_counters[i]）
+        for (UInt b = 0; b < buffer_counters[i]; b++) {
+            // 从分区结束位置往前写（避免覆盖已写入的批量数据）
+            // 例：分区0结束位置4，剩余1个元素 → 写入位置4-1=3
+            output[final_buckets[i] - 1] = buffers[offset + b];
+            // 更新结束位置（往前移1）
+            --final_buckets[i];
+        }
+    }
+
+    // 14. 释放临时分配的内存（避免内存泄漏）
+    free(final_buckets);
+    free(buffers);
+}
+
+// 条件编译结束
+#endif
+```
+
+
+### 关键对比：v2 与 v1 版本的核心差异
+v2 版本并非性能优化，而是**代码可维护性优化**，主要差异体现在“硬编码替换为宏定义”：
+
+| 对比项                | v1 版本（前序函数）              | v2 版本（当前函数）              | 优势                                                                 |
+|-----------------------|----------------------------------|----------------------------------|----------------------------------------------------------------------|
+| 填充倍数              | 硬编码 `4`                       | 宏 `TUPLES_PER_CACHELINE`        | 若Tuple大小变化（如从8字节→4字节），仅需修改宏，无需改所有硬编码     |
+| AVX批量写入步长       | 硬编码 `4`                       | 宏 `STREAM_UNIT`                 | 统一步长定义，避免代码中出现不一致的数字（如4和其他值混用）          |
+| 移位距离计算          | 硬编码 `32 - log2partitions()`   | 宏 `shift_distance()`            | 若排序位段变化（如从32位→64位整数），仅需修改宏，代码逻辑更清晰     |
+
+
+### 核心优化逻辑总结（与v1一致）
+该函数的性能优势源于3个关键优化，也是基数排序高性能实现的通用思路：
+1. **内存对齐（64字节）**：所有数组（`final_buckets`/`buffers`/`output`）均64字节对齐，避免缓存行分裂，减少缓存未命中。
+2. **AVX2流写入（_mm256_stream_si256）**：绕过缓存直接写内存，避免“不需要复用的数据占用缓存”（缓存污染），提升缓存利用率。
+3. **缓冲区批量搬运**：先将数据写入小缓冲区（`buffers`），满后批量写入大输出数组，减少“小数据量写入内存”的次数（内存写入延迟远高于缓存）。
+
+
+### 适用场景
+该函数是**高性能基数排序的核心组件**，适用于：
+- 大规模结构化数据排序（如数据库索引排序、日志按时间戳排序）；
+- 要求低延迟的场景（如高频交易数据处理）；
+- CPU支持AVX2指令集的环境（Intel Haswell及以后、AMD Ryzen及以后）。
